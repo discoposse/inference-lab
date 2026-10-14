@@ -1,0 +1,151 @@
+# deepseek-ai/DeepSeek-V4.1-Flash — MLA MoE, sliding window + top-512 sparse history over cross-layer-shared compressed KV, Engram n-gram tables.
+# From HF deepseek-ai/DeepSeek-V4.1-Flash config.json (text_config, model_type
+# deepseek_v41_text) and inference/config.json + inference/model.py of the same
+# repo: 40 layers (+3 DSpark/MTP draft layers), hidden 5120, 64 heads x
+# head_dim 512 (rope 64 of it), one shared KV head; q_lora 1280, o_lora 1024
+# over o_groups 8; window_size 128; compress_ratios 0,0, 2 x18, 1 x20;
+# kv_source_layer_ids [2,8,14,20]; index_source_layer_ids
+# [2,8,14,20,24,28,32,36]; indexer 32 heads x 128, index_topk 512;
+# candidate_source_layer 20 (2048 blocks of 8); MoE on all 40 layers: 384
+# routed + 1 shared, 6 per token, moe_intermediate 2304 (no hash-routed
+# layers, unlike V4-Flash); Engram on layers 1 and 14; mHC hc_mult 4;
+# vocab 129280; max_pos 1048576.
+#
+# Attention, per inference/model.py (Attention, Compressor, Indexer,
+# SharedAttentionRuntime) and the serving engine, vLLM
+# (vllm/models/deepseek_v4_1/attention.py, DeepseekV4Attention):
+#   every layer keeps its own 128-token sliding-window KV and attends it;
+#   layers 2, 8, 14 (ratio 2) and 20 (ratio 1) are the only ones that store a
+#   compressed KV (get_kv_cache_spec returns None for the rest) and an indexer
+#   K cache (DeepseekV4IndexerCache only on kv sources); every layer with
+#   compress_ratio > 0 attends top-512 entries of the latest source's
+#   compressed KV, selected by the latest index source (2, 8, 14, 20, 24, 28,
+#   32, 36; 24-36 score layer 20's index K inside layer 20's candidate blocks).
+#   KV per position: vLLM's default fp8_ds_mla layout (448 B nope + 128 B rope
+#   + 8 B scale = 584 B, attention.py get_kv_cache_spec) for window and
+#   compressed entries; indexer K fp8 by default (128 B + 4 B scale,
+#   _indexer_k_cache_head_dim; mxfp4 only with indexer_kv_dtype set, which this
+#   entry assumes unset). Encoded as V4-Flash's entries do: latent 512 +
+#   rope 64 at fp8 = 576 B, indexer K 128 x fp8 = 128 B.
+#   Content KV per token = 3 x (576+128)/2 + (576+128) = 1_760 B (vLLM 1_790 B);
+#   window = 40 x 128 x 576 = 2_949_120 B per sequence.
+#   (deepseek-v4-flash-0731.toml: 3_786 B per token. The repo's reference code
+#   stores compressed KV and index K at fp4, about a quarter of V4-Flash; vLLM
+#   as deployed stores fp8, so this entry is ~0.46x.)
+#
+# Known gap: the schema has no "attend a shared history without storing it".
+# The 34 layers that read another layer's compressed KV (3-7, 9-13, 15-19,
+# 21-39) are encoded window-only, so storage is exact but each misses
+# min(entries, 512) attended history positions: from 1K context on, 34 x 512
+# x 576 B = 10.0 MB of KV reads and 34 x 512 x 2 x 64 x (2x512+64) = 2.42
+# GFLOP per decoded token, plus the 24/28/32/36 indexers' scoring of up to
+# 2048 x 8 = 16_384 candidates (4 x 16_384 x 128 B = 8.4 MB). At 32K context
+# the charged decode KV read (14.6 MB) is ~44% of the true one (~33 MB); at
+# 128K ~71% (46.0 of ~64.4 MB).
+#
+# Param split (exact, from the checkpoint's safetensors headers; norms, biases,
+# attention sinks and quantization scales omitted; draft layers mtp.0-2,
+# vision tower and aligner not modelled):
+#   per expert = 3*5120*2304 = 35_389_440 (I8-packed fp4)
+#   routed fp4: active = 6 * per * 40 = 8_493_465_600;
+#               resident = 384 * per * 40 = 543_581_798_400
+#   fp8 (F8_E4M3): attention wq_a 1280x5120 + wq_b 32768x1280 + wkv 512x5120
+#     + wo_a 8192x4096 + wo_b 5120x8192 = 126_615_552 x 40 = 5_064_622_080;
+#     indexer wq_b 4096x1280 x 8 = 41_943_040; shared expert 35_389_440 x 40 =
+#     1_415_577_600 (fp8, so not in the fp4 routed stream); Engram wkv
+#     25600x6144 x 2 = 314_572_800 -> active 6_836_715_520.
+#     Engram tables (fp8 rows gathered, not GEMM'd: ParallelEngramEmbedding,
+#     resident in HBM under vLLM's default engram cpu_offload = false):
+#     (384_006_168 + 384_016_682) x 256 = 196_613_849_600 -> resident
+#     203_450_565_120. The per-token gather (24 rows x 256 B x 2 layers) is not
+#     priced.
+#   bf16: head 129280x5120 = 661_913_600; router 384x5120 x 40 = 78_643_200;
+#     compressor wkv 512x5120 x 4 + wgate 512x5120 x 3 = 18_350_080; indexer
+#     weights_proj 32x5120 x 8 + wk 128x512 x 4 = 1_572_864; mHC hc_attn_fn +
+#     hc_ffn_fn 24x20480 x 2 x 40 = 39_321_600 (F32 in the checkpoint, folded
+#     into bf16) -> active 799_801_344; + embedding 661_913_600 -> resident
+#     1_461_714_944.
+#   Sanity: modelled resident 478_164_894_208 B vs checkpoint 510_286_023_000 B
+#   (gap = draft layers + vision 8.9 GB, scales/norms 23.1 GB).
+
+name = "DeepSeek-V4.1-Flash"
+hidden_dim = 5120
+max_seq_len = 1048576
+attention_precision = "bf16"
+
+[[weights]]
+precision = "fp4"
+active_params = 8493465600
+resident_params = 543581798400
+routing = { routed_experts = 384, experts_per_tok = 6, moe_layers = 40 }
+
+[[weights]]
+precision = "fp8"
+active_params = 6836715520
+resident_params = 203450565120
+
+[[weights]]
+precision = "bf16"
+active_params = 799801344
+resident_params = 1461714944
+
+# Layers 0-1: compress_ratio 0, sliding window only (exact).
+[[layers]]
+kind = "mla"
+count = 2
+latent_dim = 512
+q_latent_dim = 1280
+o_latent_dim = 1024
+heads = 64
+qk_head_dim = 576
+v_head_dim = 512
+rope_dim = 64
+kv_precision = "fp8"
+window = 128
+
+# Layers 2, 8, 14: ratio-2 KV and index sources (own compressed KV, own
+# indexer K, own top-512 selection).
+[[layers]]
+kind = "mla"
+count = 3
+latent_dim = 512
+q_latent_dim = 1280
+o_latent_dim = 1024
+heads = 64
+qk_head_dim = 576
+v_head_dim = 512
+rope_dim = 64
+kv_precision = "fp8"
+window = 128
+history = { compress_ratio = 2, index_topk = 512, indexer = { heads = 32, head_dim = 128, kv_precision = "fp8", precision = "fp8" } }
+
+# Layer 20: ratio-1 KV, index and candidate source.
+[[layers]]
+kind = "mla"
+count = 1
+latent_dim = 512
+q_latent_dim = 1280
+o_latent_dim = 1024
+heads = 64
+qk_head_dim = 576
+v_head_dim = 512
+rope_dim = 64
+kv_precision = "fp8"
+window = 128
+history = { compress_ratio = 1, index_topk = 512, indexer = { heads = 32, head_dim = 128, kv_precision = "fp8", precision = "fp8" } }
+
+# Layers 3-7, 9-13, 15-19, 21-39: own sliding window; they also attend top-512
+# of their source's compressed KV, which they do not store — not charged here
+# (see "Known gap" above).
+[[layers]]
+kind = "mla"
+count = 34
+latent_dim = 512
+q_latent_dim = 1280
+o_latent_dim = 1024
+heads = 64
+qk_head_dim = 576
+v_head_dim = 512
+rope_dim = 64
+kv_precision = "fp8"
+window = 128

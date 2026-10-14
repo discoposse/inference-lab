@@ -1,0 +1,287 @@
+use serde::{Deserialize, Serialize};
+use std::fs::File;
+use std::io::{BufRead, BufReader, Lines};
+use std::path::Path;
+
+/// A batch tokenizer: takes prompt inputs (chat messages or raw prompts)
+/// and returns one token vector each. Supplied by the CLI (HF tokenizers +
+/// chat template); the tokenizer should apply the chat template itself for
+/// chat-style requests.
+pub type BatchTokenizerFn = Box<dyn Fn(&[PromptInput]) -> Result<Vec<Vec<u32>>, String> + Send>;
+
+/// OpenAI Batch API format - JSONL entries
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchRequest {
+    pub custom_id: String,
+    pub method: String,
+    pub url: String,
+    pub body: RequestBody,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestBody {
+    pub model: String,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    #[serde(flatten)]
+    pub input: RequestInput,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RequestInput {
+    Chat { messages: Vec<Message> },
+    Completion { prompt: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Message {
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum PromptInput {
+    Messages(Vec<Message>),
+    Prompt(String),
+}
+
+/// A processed dataset entry ready for simulation
+#[derive(Debug, Clone)]
+pub struct DatasetEntry {
+    pub request_id: String,
+    pub prompt_tokens: Vec<u32>,
+    pub max_output_tokens: Option<u32>,
+}
+
+impl DatasetEntry {
+    pub fn num_prompt_tokens(&self) -> u32 {
+        self.prompt_tokens.len() as u32
+    }
+}
+
+/// Unparsed entry from dataset (before tokenization)
+#[derive(Debug, Clone)]
+pub struct UnparsedEntry {
+    pub request_id: String,
+    pub prompt_input: PromptInput,
+    pub max_output_tokens: Option<u32>,
+}
+
+/// Iterator over dataset entries: parses each JSONL line, skipping empty
+/// ones. Tokenisation happens later, in batches, on the generator's
+/// background thread.
+pub struct DatasetIterator<R: BufRead> {
+    lines: Lines<R>,
+    line_num: usize,
+}
+
+impl<R: BufRead> DatasetIterator<R> {
+    pub fn new(reader: R) -> Self {
+        Self {
+            lines: reader.lines(),
+            line_num: 0,
+        }
+    }
+}
+
+impl<R: BufRead> Iterator for DatasetIterator<R> {
+    type Item = Result<UnparsedEntry, Box<dyn std::error::Error>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            self.line_num += 1;
+            let line = match self.lines.next() {
+                Some(Ok(line)) => line,
+                Some(Err(e)) => return Some(Err(Box::new(e))),
+                None => return None,
+            };
+
+            // Skip empty lines
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            // Parse the batch request (but don't tokenize yet - that happens in batches)
+            let batch_request: BatchRequest = match serde_json::from_str(&line) {
+                Ok(req) => req,
+                Err(e) => {
+                    return Some(Err(format!(
+                        "Failed to parse line {}: {}",
+                        self.line_num, e
+                    )
+                    .into()))
+                }
+            };
+
+            return Some(Ok(UnparsedEntry {
+                request_id: batch_request.custom_id,
+                prompt_input: match batch_request.body.input {
+                    RequestInput::Chat { messages } => PromptInput::Messages(messages),
+                    RequestInput::Completion { prompt } => PromptInput::Prompt(prompt),
+                },
+                max_output_tokens: batch_request.body.max_tokens,
+            }));
+        }
+    }
+}
+
+/// Dataset loader that provides lazy iteration over entries
+pub struct DatasetLoader;
+
+impl DatasetLoader {
+    fn count_non_empty_lines<R: BufRead>(reader: R) -> Result<usize, std::io::Error> {
+        let mut count = 0;
+        for line in reader.lines() {
+            if !line?.trim().is_empty() {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Count the number of non-empty lines in a JSONL file (fast approximation of entry count)
+    pub fn count_entries<P: AsRef<Path>>(path: P) -> Result<usize, std::io::Error> {
+        let file = File::open(path)?;
+        let reader = BufReader::new(file);
+        Self::count_non_empty_lines(reader)
+    }
+
+    /// Create an iterator from a JSONL file in OpenAI batch API format
+    /// Returns unparsed entries (without tokenization)
+    pub fn from_file<P: AsRef<Path>>(
+        path: P,
+    ) -> Result<DatasetIterator<BufReader<File>>, std::io::Error> {
+        let file = File::open(path)?;
+        let reader = BufReader::new(file);
+        Ok(DatasetIterator::new(reader))
+    }
+
+    /// Create an iterator from a string (useful for testing or WASM)
+    /// Returns unparsed entries (without tokenization)
+    pub fn from_string(data: String) -> DatasetIterator<BufReader<std::io::Cursor<String>>> {
+        let cursor = std::io::Cursor::new(data);
+        let reader = BufReader::new(cursor);
+        DatasetIterator::new(reader)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{self, Read};
+
+    #[test]
+    fn test_parse_batch_request() {
+        let json = r#"{
+            "custom_id": "request-1",
+            "method": "POST",
+            "url": "/v1/chat/completions",
+            "body": {
+                "model": "gpt-3.5-turbo",
+                "messages": [
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": "Hello, how are you?"}
+                ],
+                "max_tokens": 100
+            }
+        }"#;
+
+        let batch_request: BatchRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(batch_request.custom_id, "request-1");
+        match batch_request.body.input {
+            RequestInput::Chat { messages } => assert_eq!(messages.len(), 2),
+            RequestInput::Completion { .. } => panic!("expected chat request"),
+        }
+        assert_eq!(batch_request.body.max_tokens, Some(100));
+    }
+
+    #[test]
+    fn test_dataset_iterator() {
+        let test_data = r#"{"custom_id": "req-1", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "gpt-3.5-turbo", "messages": [{"role": "user", "content": "Hello"}], "max_tokens": 10}}
+{"custom_id": "req-2", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "gpt-3.5-turbo", "messages": [{"role": "user", "content": "World"}], "max_tokens": 20}}"#;
+
+        let mut iter = DatasetLoader::from_string(test_data.to_string());
+
+        let entry1 = iter.next().unwrap().unwrap();
+        assert_eq!(entry1.request_id, "req-1");
+        match entry1.prompt_input {
+            PromptInput::Messages(messages) => {
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages[0].role, "user");
+                assert_eq!(messages[0].content, "Hello");
+            }
+            PromptInput::Prompt(_) => panic!("expected chat prompt input"),
+        }
+        assert_eq!(entry1.max_output_tokens, Some(10));
+
+        let entry2 = iter.next().unwrap().unwrap();
+        assert_eq!(entry2.request_id, "req-2");
+        assert_eq!(entry2.max_output_tokens, Some(20));
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn test_parse_completion_batch_request() {
+        let json = r#"{
+            "custom_id": "request-2",
+            "method": "POST",
+            "url": "/v1/completions",
+            "body": {
+                "model": "gpt-3.5-turbo-instruct",
+                "prompt": "Hello, world",
+                "max_tokens": 32
+            }
+        }"#;
+
+        let batch_request: BatchRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(batch_request.custom_id, "request-2");
+        match batch_request.body.input {
+            RequestInput::Completion { prompt } => assert_eq!(prompt, "Hello, world"),
+            RequestInput::Chat { .. } => panic!("expected completion request"),
+        }
+        assert_eq!(batch_request.body.max_tokens, Some(32));
+    }
+
+    #[test]
+    fn test_count_entries_propagates_read_errors() {
+        struct FailingReader {
+            bytes: Vec<u8>,
+            pos: usize,
+            fail_after: usize,
+        }
+
+        impl Read for FailingReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.pos >= self.fail_after {
+                    return Err(io::Error::other("forced read failure"));
+                }
+
+                let remaining_until_failure = self.fail_after.saturating_sub(self.pos);
+                let remaining_bytes = self.bytes.len().saturating_sub(self.pos);
+                let to_copy = buf.len().min(remaining_until_failure).min(remaining_bytes);
+
+                if to_copy == 0 {
+                    return Ok(0);
+                }
+
+                buf[..to_copy].copy_from_slice(&self.bytes[self.pos..self.pos + to_copy]);
+                self.pos += to_copy;
+                Ok(to_copy)
+            }
+        }
+
+        let reader = BufReader::new(FailingReader {
+            bytes: b"first\nsecond\n".to_vec(),
+            pos: 0,
+            fail_after: 7,
+        });
+
+        let err = DatasetLoader::count_non_empty_lines(reader).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+    }
+}

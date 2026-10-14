@@ -1,0 +1,12 @@
+model = "glm-5.3-flash-nvfp4"
+
+[scheduler]
+max_num_batched_tokens = 16384
+max_num_seqs = 20
+policy = "priority"
+enable_chunked_prefill = true
+block_size = 64
+gpu_memory_utilization = 0.9
+
+[hardware.b300]
+tp = 1

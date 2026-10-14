@@ -1,0 +1,59 @@
+# NVIDIA RTX PRO 6000 Blackwell Server Edition (PCIe card), dense peaks; 96 GB GDDR7, 1.6 TB/s.
+# NVIDIA's spec table (nvidia.com/en-us/data-center/rtx-pro-6000-blackwell-server-edition; Lenovo
+# Press LP2263) gives FP4 4 PFLOPS, FP8 2 PFLOPS, FP16/BF16 1 PFLOP with no sparsity note. Those are
+# with-sparsity figures: the same GB202 part's 4000 AI TOPS on the Workstation Edition page is footnoted
+# "Theoretical FP4 TOPS using sparsity" (nvidia.com/en-us/products/workstations/professional-desktop-
+# gpus/rtx-pro-6000), and GB202's dense FP4 rate (RTX Blackwell GPU architecture whitepaper,
+# Appendix A: 1676 dense / 3352 sparse TFLOPS on 170 SMs at 2407 MHz = 4096 FP4 FLOP/clk/SM) on this
+# card's 188 SMs (24,064 CUDA cores / 128) reaches 4 PFLOPS only with sparsity. Dense = half of
+# NVIDIA's figures. (The 3.7 PFLOPS FP4 figure seen elsewhere is the same sparse rate at a lower clock.)
+
+name = "RTX PRO 6000"
+# FP4 Tensor Core 4 PFLOPS with sparsity -> 2 dense.
+flops_fp4 = 2.0e15
+# FP8 Tensor Core 2 PFLOPS with sparsity -> 1 dense.
+flops_fp8 = 1.0e15
+# BF16 Tensor Core 1 PFLOP with sparsity -> 0.5 dense.
+flops_bf16 = 5.0e14
+# FP16 Tensor Core 1 PFLOP with sparsity -> 0.5 dense.
+flops_fp16 = 5.0e14
+# Memory bandwidth 1597 GB/s.
+memory_bandwidth = 1.597e12
+# 96 GB GDDR7.
+memory_capacity = 96000000000
+
+# Fabric: no NVLink (LP2263: "NVLink support: No"); GPUs reach each other only over their PCIe 5.0 x16
+# host interface, 128 GB/s both ways = 64 GB/s per direction, through the host (no switch reduction),
+# and that same port also carries host-DRAM traffic. gpus_per_node is a cloud VM with two of these GPUs.
+# The VM's NIC is not documented; scale_out is NVIDIA's RTX PRO
+# Server reference instead, "up to 400 Gb/s of network bandwidth per RTX PRO 6000 Blackwell GPU"
+# (ConnectX-8 SuperNIC, 2:1 GPU-to-NIC; developer.nvidia.com/blog/nvidia-connectx-8-supernics-advance-
+# ai-platform-architecture-with-pcie-gen6-connectivity) = 50 GB/s per direction. Per-call latencies
+# are the b300/h100 presets' values, not measured on this card.
+[fabric]
+gpus_per_node = 2
+scale_up = { bandwidth = 6.4e10, latency = 5e-6 }
+scale_out = { bandwidth = 5.0e10, latency = 2e-5 }
+
+# KV memory beyond HBM (see docs: [memory]). Host DRAM: such a VM's allocatable memory, 297,041,100 KiB
+# (Kubernetes allocatable, not installed DIMMs), one pool for the
+# node, reached over each GPU's PCIe 5.0 x16 port (64 GB/s per direction, as above). No NVMe
+# throughput is documented for the VM, so no NVMe store. `nic` restates scale_out (reference NIC, as
+# above) for the memory graph.
+[memory]
+[[memory.stores]]
+name = "host_dram"
+per = "node"
+capacity = 3.041700864e11
+
+[[memory.links]]
+name = "pcie"
+from = "gpu"
+to = "host_dram"
+bandwidth = 6.4e10
+
+[[memory.links]]
+name = "nic"
+from = "gpu"
+to = "network"
+bandwidth = 5.0e10

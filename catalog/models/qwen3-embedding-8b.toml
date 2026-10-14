@@ -1,0 +1,34 @@
+# Qwen/Qwen3-Embedding-8B — dense GQA embedding model (Qwen3-8B backbone, no lm_head), BF16.
+# Architecture: HF Qwen/Qwen3-Embedding-8B config.json (model_type qwen3)
+# matches Qwen/Qwen3-8B's except vocab_size (151665 vs 151936):
+#   36 layers, hidden 4096, 32 q / 8 kv heads, head_dim 128 (q_norm/k_norm),
+#   SiLU MLP inter 12288; max_position_embeddings 40960. The checkpoint has
+#   no lm_head: an embedding is the pooled last hidden state, so a request
+#   is a prefill with no decode and no output projection. All weights BF16;
+#   KV bf16 (vLLM with --kv-cache-dtype unset: auto =
+#   the model dtype).
+#
+# Param split, exact from the safetensors headers (norms omitted):
+#   attention per layer: q 4096x4096 + k 1024x4096 + v 1024x4096 +
+#     o 4096x4096 = 41_943_040; x 36 = 1_509_949_440
+#   MLP per layer 3*4096*12288 = 150_994_944; x 36 = 5_435_817_984
+#   active = 6_945_767_424; + embedding 151665x4096 = 621_219_840 ->
+#   resident 7_566_987_264
+
+name = "Qwen3-Embedding-8B"
+hidden_dim = 4096
+max_seq_len = 40960
+attention_precision = "bf16"
+
+[[weights]]
+precision = "bf16"
+active_params = 6945767424
+resident_params = 7566987264
+
+[[layers]]
+kind = "attention"
+count = 36
+heads = 32
+head_dim = 128
+kv_heads = 8
+kv_precision = "bf16"

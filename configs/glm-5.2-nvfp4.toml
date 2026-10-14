@@ -1,0 +1,13 @@
+model = "glm-5.2-nvfp4"
+
+[scheduler]
+max_num_batched_tokens = 32768
+max_num_seqs = 64
+policy = "priority"
+enable_chunked_prefill = true
+block_size = 64
+gpu_memory_utilization = 0.849
+
+[hardware.b300]
+tp = 4
+dp_attention = true

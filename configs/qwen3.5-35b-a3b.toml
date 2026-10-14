@@ -1,0 +1,19 @@
+model = "qwen3.5-35b-a3b"
+
+[scheduler]
+max_num_batched_tokens = 16384
+max_num_seqs = 4096
+policy = "fcfs"
+enable_chunked_prefill = true
+block_size = 64
+
+[speculative]
+gamma = 4
+policy = "goodput_budget"
+
+[speculative.acceptance]
+kind = "constant"
+alpha = 0.75
+
+[hardware.b200]
+tp = 1

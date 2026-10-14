@@ -1,0 +1,98 @@
+# zai-org/GLM-5.3-Flash — KDA linear attention + DSA MLA hybrid (kpool-compressed indexer) + MoE, FP8.
+# From HF zai-org/GLM-5.3-Flash config.json (text_config, model_type
+# glm5_next_text; quantization fp8, block 128x128):
+#   45 layers, hidden 4096, vocab 154880 (untied), max_pos 1048576;
+#   linear_attn_config: 34 kda_layers (64 heads x 128, short_conv 4) and
+#   11 full_attn_layers [3, 7, ..., 43] (DSA MLA: 64 heads, q_lora 1536,
+#   kv_lora 512, qk_nope 256, qk_rope 0 / mla_use_nope, v_head 256;
+#   indexer 32 heads x 128, index_topk 2048, index_kpool 4 compressed,
+#   always_select_tail); MoE: first 3 layers dense (inter 12288), 42 MoE
+#   layers with 288 routed + 1 shared expert, 8 per token, moe_intermediate
+#   2048; mHC hyper-connections (hc_mult 4). Not modelled: the 1 MTP layer
+#   (layer 45), the vision tower (24 layers), the mHC residual mixing beyond
+#   its weights.
+#
+# Param split, exact from the checkpoint's safetensors headers (layers 0-44;
+# norms, biases, A_log/dt_bias, hc base/scale, kpool ape and quantization
+# scales omitted). Stored dtypes: experts, dense MLP and the MLA
+# q_a/q_b/kv_a/o projections F8_E4M3; everything else BF16.
+#   per expert = 3*4096*2048 = 25_165_824
+#   fp8 experts:  active = (8 + 1 shared) * per * 42 = 9_512_681_472
+#                 resident = (288 + 1)     * per * 42 = 305_462_771_712
+#   fp8 rest: dense MLP 3 * 3*4096*12288 = 452_984_832
+#     + MLA (q_a 1536x4096 + q_b 16384x1536 + kv_a 512x4096 + o 4096x16384
+#       = 100_663_296) * 11 = 1_107_296_256          -> 1_560_281_088
+#   bf16: KDA (q,k,v 8192x4096 + o 4096x8192 + f_a/g_a 128x4096 + f_b/g_b
+#       8192x128 + b 64x4096 + 3 conv 8192x4 = 137_723_904) * 34 = 4_682_612_736
+#     + MLA kv_b 32768x512 * 11 = 184_549_376
+#     + indexer (wq_b 4096x1536 + wk 128x4096 + weights_proj 32x4096
+#       + kpool_compress_gate 128x4096 = 7_471_104) * 11 = 82_182_144
+#     + mHC (hc_attn_fn + hc_ffn_fn 2 x 24x16384) * 45 = 35_389_440
+#     + router 288x4096 * 42 = 49_545_216;  lm_head 154880x4096 = 634_388_480
+#     active = 5_668_667_392;  resident (+ embedding 634_388_480) = 6_303_055_872
+#   Sanity: resident bytes 319_629_164_544 vs the checkpoint's text layers
+#   0-44 at 319_706_118_392 B (gap = norms + block scales).
+#
+# KV: on H200 (TP4/EP4) with --kv-cache-dtype bfloat16 and the tilelang DSA
+# backends, the MLA latent is stored raw at
+# bf16: kv_cache_dim = kv_lora_rank + qk_rope_head_dim = 512
+# (sglang mem_cache/kv_cache_configurator.py calculate_mla_kv_cache_dim).
+# DSA indexer (sglang layers/attention/dsa/dsa_indexer_kpool.py IndexerKPool,
+# kpool_fp8_index.py topk_from_pooled_history_logits): the indexer key is
+# pooled over 4 positions (a learned gate + ape, one fp8 key per pool),
+# scores the pooled history, keeps the top index_topk / 4 = 512 pools and
+# expands each to its 4 positions -> 2048 attended, plus the open pool's
+# tail (< 4 positions, always selected). SGLang still allocates one fp8
+# indexer slot (128 B + 4 B scale) per token per DSA layer
+# (model_executor/pool_configurator.py _compute_dsa_indexer_cell_size), so
+# the indexer is encoded at its true shape 32 x 128 over every position:
+# indexer KV storage matches the allocation; indexer scoring FLOPs and
+# indexer-KV reads are over-priced 4x (SGLang scores t/4 pooled keys), and
+# the <= 3 tail positions are not counted.
+# KDA state per layer per sequence, as SGLang allocates it
+# (configs/glm5_next.py mamba2_cache_params -> configs/mamba_utils.py
+# KimiLinearStateShape.create; dtype from mamba2_state_dtype: temporal
+# float32 by default, conv bfloat16, with neither --mamba-ssm-dtype
+# nor SGLANG_MAMBA_SSM_DTYPE set): temporal 64 x 128 x 128 x 4 B = 4_194_304
+# + conv (kernel-1 = 3) x (q 8192 + k 8192 + v 8192) x 2 B = 147_456
+# = 4_341_760 B. This differs from the older kimi-k3 / qwen3.5 entries'
+# convention (bf16 temporal, 4 conv taps).
+
+name = "GLM-5.3-Flash"
+hidden_dim = 4096
+max_seq_len = 1048576
+attention_precision = "bf16"
+
+[[weights]]
+precision = "fp8"
+active_params = 9512681472
+resident_params = 305462771712
+routing = { routed_experts = 288, experts_per_tok = 8, moe_layers = 42 }
+
+[[weights]]
+precision = "fp8"
+active_params = 1560281088
+resident_params = 1560281088
+
+[[weights]]
+precision = "bf16"
+active_params = 5668667392
+resident_params = 6303055872
+
+[[layers]]
+kind = "mla"
+count = 11
+latent_dim = 512
+q_latent_dim = 1536
+rope_dim = 0
+kv_precision = "bf16"
+window = 0
+history = { compress_ratio = 1, index_topk = 2048, indexer = { heads = 32, head_dim = 128, kv_precision = "fp8", precision = "fp8" } }
+heads = 64
+qk_head_dim = 256
+v_head_dim = 256
+
+[[layers]]
+kind = "linear"
+count = 34
+state_bytes = 4341760

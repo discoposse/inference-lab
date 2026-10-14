@@ -1,0 +1,14 @@
+model = "glm-5.2-mxfp4"
+
+[scheduler]
+max_num_batched_tokens = 32768
+max_num_seqs = 128
+policy = "priority"
+enable_chunked_prefill = true
+block_size = 64
+gpu_memory_utilization = 0.85
+
+[hardware.mi355x]
+tp = 4
+ep = 4
+dp_attention = true

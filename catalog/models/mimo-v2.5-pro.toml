@@ -1,0 +1,71 @@
+# XiaomiMiMo/MiMo-V2.5-Pro — GQA MoE, hybrid 10 full + 60 sliding(128) attention layers, FP8.
+# Architecture: HF XiaomiMiMo/MiMo-V2.5-Pro config.json (model_type mimo_v2)
+# and its modeling_mimo_v2.py:
+#   70 layers; hybrid_layer_pattern: 0 = full attention (layers 0, 7, 15,
+#   23, 31, 39, 47, 55, 62, 69), 1 = sliding-window attention over
+#   sliding_window = 128 tokens (60 layers); hidden 6144; every layer 128 q
+#   heads, 8 KV heads, K head_dim 192, V head_dim 128 (swa_* fields equal);
+#   layer 0 dense MLP (inter 16384), 69 MoE layers of 384 routed experts, 8
+#   per token, no shared expert (moe_intermediate 2048); vocab 152576
+#   (untied); max_position_embeddings 1048576. 3 MTP layers (model.mtp.*)
+#   not modelled. Checkpoint FP8 (128x128 blocks) except o_proj
+#   (ignored_layers), router gates (F32), lm_head and embedding (BF16).
+#   KV bf16: with no --kv-cache-dtype set, SGLang's "auto"
+#   is the model dtype when the quant config declares no KV scheme
+#   (srt/mem_cache/kv_cache_dtype.py).
+#
+# K and V widths differ (192 / 128), so the attention classes use head_dim
+# 160 = (192 + 128) / 2: KV per token 2 x 8 x 160 = 8 x (192 + 128) and
+# score/AV FLOPs 4 x 128 x 160 = 2 x 128 x (192 + 128) per pair, both exact.
+#
+# Param split, exact from the safetensors headers (layers 0-69; norms,
+# attention sink biases, e_score_correction_bias and scale_inv omitted):
+#   per expert = 3*6144*2048 = 37_748_736
+#   fp8 routed: active   8 * per * 69 = 20_837_302_272
+#               resident 384 * per * 69 = 1_000_190_509_056
+#   fp8: qkv_proj 27136x6144 (x 70) = 11_670_650_880; dense MLP 3*6144*16384
+#     = 301_989_888 -> 11_972_640_768
+#   bf16: o_proj 6144x16384 (x 70) = 7_046_430_720; lm_head 152576x6144 =
+#     937_426_944; router 384x6144 (x 69, stored F32, folded in here) =
+#     162_791_424 -> active 8_146_649_088; + embedding 937_426_944 ->
+#     resident 9_084_076_032
+#
+# Modelled directly: 10 full-attention and 60 sliding(128) attention classes (window KV and window attention FLOPs exact); attention sinks not modelled.
+
+name = "MiMo-V2.5-Pro"
+hidden_dim = 6144
+max_seq_len = 1048576
+attention_precision = "bf16"
+
+[[weights]]
+precision = "fp8"
+active_params = 20837302272
+resident_params = 1000190509056
+routing = { routed_experts = 384, experts_per_tok = 8, moe_layers = 69 }
+
+[[weights]]
+precision = "fp8"
+active_params = 11972640768
+resident_params = 11972640768
+
+[[weights]]
+precision = "bf16"
+active_params = 8146649088
+resident_params = 9084076032
+
+[[layers]]
+kind = "attention"
+count = 10
+heads = 128
+head_dim = 160
+kv_heads = 8
+kv_precision = "bf16"
+
+[[layers]]
+kind = "attention"
+count = 60
+heads = 128
+head_dim = 160
+kv_heads = 8
+window = 128
+kv_precision = "bf16"

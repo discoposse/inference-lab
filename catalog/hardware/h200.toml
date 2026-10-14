@@ -1,0 +1,62 @@
+# NVIDIA H200 SXM (HGX H200), dense datasheet peaks; 141 GB HBM3e, 4.8 TB/s.
+# Figures: NVIDIA H200 Tensor Core GPU datasheet / nvidia.com/en-us/data-center/h200, H200 SXM column.
+# NVIDIA quotes the tensor rates with sparsity; the dense rates below are half of them.
+# Hopper has no FP4 tensor rate: as in gh200.toml, FP4 weights run at the FP8 rate.
+
+name = "H200"
+# = flops_fp8 (no FP4 tensor rate on Hopper; fp4 weights dequantised to the fp8 path).
+flops_fp4 = 1.979e15
+# FP8 Tensor Core 3,958 TFLOPS with sparsity -> 1,979 dense.
+flops_fp8 = 1.979e15
+# BFLOAT16 Tensor Core 1,979 TFLOPS with sparsity -> 989.5 dense.
+flops_bf16 = 9.895e14
+# FP16 Tensor Core 1,979 TFLOPS with sparsity -> 989.5 dense.
+flops_fp16 = 9.895e14
+# GPU memory bandwidth 4.8 TB/s.
+memory_bandwidth = 4.8e12
+# GPU memory 141 GB.
+memory_capacity = 141000000000
+
+# Fabric: HGX H200, 8 GPUs (Modal: "All H100 and H200 GPUs on the Modal platform are of the SXM
+# variant", up to 8 per container on one machine, modal.com/docs/guide/gpu; NVIDIA: HGX H200 in four-
+# and eight-way configurations on NVLink and NVSwitch, nvidianews.nvidia.com, 13 Nov 2023). NVLink
+# 900 GB/s per GPU bidirectional (datasheet) = 450 GB/s per direction; the NVSwitch reduces in-network
+# (NVLink SHARP engines in each NVLink Switch, nvidia.com/en-us/data-center/nvlink), as in h100.toml.
+# scale_out: Modal clusters' RDMA network is 3,200 Gbps per 8-GPU H200 node (modal.com/docs/guide/
+# multi-node-clusters) = 400 Gb/s = 50 GB/s per direction per GPU (the same as one ConnectX-7 per GPU
+# on the HGX reference). Per-call latencies are the h100 preset's values, not measured on H200.
+[fabric]
+gpus_per_node = 8
+scale_up = { bandwidth = 4.5e11, latency = 5e-6, in_network_reduction = true }
+scale_out = { bandwidth = 5.0e10, latency = 2e-5 }
+
+# KV memory beyond HBM (see docs: [memory]). Host DRAM: the largest memory a Modal H200 sandbox may
+# request, 3,145,728 MiB (Modal's sandbox create-call bound; it bounds a sandbox, not the GPU
+# count), one pool per node, reached
+# over each GPU's PCIe Gen5 x16 port (datasheet: "PCIe Gen5: 128GB/s" = 64 GB/s per direction).
+# Daytona's H200 sandboxes cap lower, 192 GB per GPU (daytona.io/docs/en/sandboxes). No local NVMe
+# throughput is published for either, so no NVMe store. `nvlink` and `nic` restate the fabric for the
+# memory graph: NVLink per-GPU ports into the node's switch, one NIC per GPU to the network core.
+[memory]
+[[memory.stores]]
+name = "host_dram"
+per = "node"
+capacity = 3.298534883328e12
+
+[[memory.links]]
+name = "pcie"
+from = "gpu"
+to = "host_dram"
+bandwidth = 6.4e10
+
+[[memory.links]]
+name = "nvlink"
+from = "gpu"
+to = "switch"
+bandwidth = 4.5e11
+
+[[memory.links]]
+name = "nic"
+from = "gpu"
+to = "network"
+bandwidth = 5.0e10

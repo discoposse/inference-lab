@@ -1,0 +1,666 @@
+//! Routing requests across the replicas of a pool.
+//!
+//! The engine asks the pool's [`Router`] for a replica on every arrival
+//! (and, on a disaggregated topology, again when a hand-off lands on the
+//! decode pool). The router sees one [`WorkerSignal`] per replica taking
+//! new work — per rank of each, under DP-attention, where each rank has its
+//! own scheduler and KV cache and the router picks the rank too, as Dynamo
+//! routes to a `(worker, dp_rank)`: queue depth, queued prefill work, KV
+//! occupancy and — when it asks for it — an estimate of how much of this
+//! prompt that replica (or rank) already holds in its KV cache. That estimate is what a KV-aware front
+//! end (dynamo's KV router, SGLang's cache-aware router) works from: an
+//! approximation of the replica's prefix tree, not the scheduler's exact
+//! admission-time lookup.
+//!
+//! A router that keeps its own state instead — an external router fed by
+//! events, as Dynamo's KV router is — hears about the pool through the
+//! trait's notification methods: workers joining and leaving, each request
+//! it routed reaching its first token and finishing, and every block the
+//! workers' prefix caches store or evict ([`Router::wants_kv_events`]).
+//! Every call carries the simulation time `now_s` it happens at; calls
+//! arrive in time order.
+
+use crate::config::RouterConfig;
+use crate::request::Request;
+
+/// Stable identity of a worker in a topology: assigned when the worker is
+/// built (a fixed topology numbers its workers `0..` pool by pool) or added
+/// at run time, and never reused. It is the worker's id in the topology's
+/// memory graph and the `worker` a request's timing reports. Under
+/// DP-attention each rank of a replica is a worker with its own id — its own
+/// scheduler and KV cache — and a replica's ranks have consecutive ids, the
+/// first of which names the replica.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct WorkerId(pub u32);
+
+impl std::fmt::Display for WorkerId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "w{}", self.0)
+    }
+}
+
+/// What a router can see about one routing target at routing time: a
+/// replica, or one DP-attention rank of one. The load and KV fields are the
+/// target's own — under DP-attention a rank's scheduler and KV cache, not
+/// its replica's.
+#[derive(Debug, Clone)]
+pub struct WorkerSignal {
+    /// The target: what `route` answers with to place a request here.
+    pub worker: WorkerId,
+    /// The replica it belongs to (its first rank's id; `worker` itself
+    /// without DP-attention).
+    pub replica: WorkerId,
+    /// Its DP rank within the replica (0 without DP-attention).
+    pub rank: u32,
+    /// Requests admitted and holding KV (prefilling or decoding).
+    pub running: usize,
+    /// Requests queued or parked on a KV promotion.
+    pub waiting: usize,
+    /// Prompt tokens still to be prefilled across the target's queue and
+    /// its in-progress prefills: the prefill work ahead of a new arrival.
+    pub queued_prefill_tokens: u64,
+    /// KV cache occupancy, 0..1.
+    pub kv_util: f64,
+    /// Tokens of context the target's free KV blocks could hold right now.
+    pub free_kv_tokens: u64,
+    /// Estimated prompt tokens the target holds for this request. Which
+    /// tiers count depends on what the router asked for
+    /// (`Router::prefix_signal`): any tier, or HBM-resident only. `None`
+    /// when the router did not ask.
+    pub cached_prefix_tokens: Option<u32>,
+}
+
+/// Which prefix estimate a router wants in `WorkerSignal::cached_prefix_tokens`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefixSignal {
+    /// None: the router ignores KV state.
+    None,
+    /// Prompt tokens held anywhere on the target (HBM, in flight, or a
+    /// spillover tier): what a prefill there could skip computing.
+    Cached,
+    /// Prompt tokens resident in the target's HBM: what a KV transfer to
+    /// it could skip moving.
+    Resident,
+}
+
+impl WorkerSignal {
+    /// Requests in the system on this target.
+    pub fn in_system(&self) -> usize {
+        self.running + self.waiting
+    }
+}
+
+/// Picks a replica for each request. Every method but [`Router::route`]
+/// has a default that ignores the call, so a stateless policy implements
+/// `route` alone.
+pub trait Router: Send {
+    /// Which prefix estimate the engine should put in
+    /// `WorkerSignal::cached_prefix_tokens` (a lookup on every replica per
+    /// routing decision). None by default.
+    fn prefix_signal(&self) -> PrefixSignal {
+        PrefixSignal::None
+    }
+
+    /// Whether the engine should report the workers' prefix-cache changes
+    /// through [`Router::on_kv_stored`] and [`Router::on_kv_removed`].
+    /// Recording them costs a little on every allocation, so it is off
+    /// unless asked for. Read when the router is installed.
+    fn wants_kv_events(&self) -> bool {
+        false
+    }
+
+    /// Where `req` goes, at time `now_s`: the `worker` of one of `workers`,
+    /// which has one entry per replica taking new work (joined and not
+    /// draining) — per rank of each under DP-attention — and is never
+    /// empty.
+    fn route(&mut self, req: &Request, workers: &[WorkerSignal], now_s: f64) -> WorkerId;
+
+    /// A replica joined the pool and takes new work from now on: `worker`
+    /// names it, and its `ranks` routing targets are `worker.0 ..
+    /// worker.0 + ranks` (one, `worker` itself, without DP-attention), as
+    /// Dynamo registers a worker with its `dp_size`. Called for every
+    /// replica already in the pool when the router is installed.
+    fn on_worker_added(&mut self, _worker: WorkerId, _ranks: u32, _now_s: f64) {}
+
+    /// The replica `worker` names left the pool, drained or killed, with
+    /// all its ranks. Their prefix caches went with them: no removal events
+    /// follow for their blocks.
+    fn on_worker_removed(&mut self, _worker: WorkerId, _now_s: f64) {}
+
+    /// `req` was just routed to `worker` (by this router).
+    fn on_routed(&mut self, _req: &Request, _worker: WorkerId, _now_s: f64) {}
+
+    /// A request this router placed on `worker` finished its prefill: its
+    /// first token was produced (on a prefill pool, its hand-off began).
+    fn on_prefill_complete(&mut self, _request_id: &str, _worker: WorkerId, _now_s: f64) {}
+
+    /// A request this router placed on `worker` left it: it finished there,
+    /// its KV hand-off to the decode pool drained, or its hand-off failed
+    /// after this router had routed it. Not called for requests failed by
+    /// the worker's removal.
+    fn on_request_complete(&mut self, _request_id: &str, _worker: WorkerId, _now_s: f64) {}
+
+    /// `worker`'s prefix cache stored consecutive blocks of one sequence,
+    /// each `(local_hash, sequence_hash)`, following the block whose
+    /// sequence hash is `parent_sequence_hash` (`None`: from the start).
+    /// Only with [`Router::wants_kv_events`].
+    fn on_kv_stored(
+        &mut self,
+        _worker: WorkerId,
+        _parent_sequence_hash: Option<u64>,
+        _blocks: &[(u64, u64)],
+        _now_s: f64,
+    ) {
+    }
+
+    /// `worker`'s prefix cache evicted these blocks. Only with
+    /// [`Router::wants_kv_events`].
+    fn on_kv_removed(&mut self, _worker: WorkerId, _sequence_hashes: &[u64], _now_s: f64) {}
+}
+
+/// Build the router a config names.
+pub fn build_router(cfg: &RouterConfig) -> Box<dyn Router> {
+    match cfg {
+        RouterConfig::RoundRobin {} => Box::new(RoundRobin::default()),
+        RouterConfig::LeastLoaded {} => Box::new(LeastLoaded),
+        RouterConfig::SessionAffinity {} => Box::new(SessionAffinity::default()),
+        RouterConfig::PrefixAffinity { max_load_ratio } => Box::new(PrefixAffinity {
+            max_load_ratio: *max_load_ratio,
+        }),
+        RouterConfig::KvAware { load_weight } => Box::new(KvAware {
+            load_weight: *load_weight,
+        }),
+        RouterConfig::KvAwareDecode { load_weight } => Box::new(KvAwareDecode {
+            load_weight: *load_weight,
+        }),
+    }
+}
+
+/// Cycle through the replicas.
+#[derive(Debug, Default)]
+pub struct RoundRobin {
+    next: usize,
+}
+
+impl RoundRobin {
+    fn pick(&mut self, workers: &[WorkerSignal]) -> WorkerId {
+        let n = workers.len().max(1);
+        let idx = self.next % n;
+        self.next = (idx + 1) % n;
+        workers[idx].worker
+    }
+}
+
+impl Router for RoundRobin {
+    fn route(&mut self, _req: &Request, workers: &[WorkerSignal], _now_s: f64) -> WorkerId {
+        self.pick(workers)
+    }
+}
+
+/// Fewest requests in the system; ties broken by queued prefill tokens,
+/// then by index.
+#[derive(Debug, Default)]
+pub struct LeastLoaded;
+
+/// Index into `workers` of the least loaded.
+fn least_loaded(workers: &[WorkerSignal]) -> usize {
+    let mut best = 0usize;
+    for (i, w) in workers.iter().enumerate().skip(1) {
+        let b = &workers[best];
+        if (w.in_system(), w.queued_prefill_tokens) < (b.in_system(), b.queued_prefill_tokens) {
+            best = i;
+        }
+    }
+    best
+}
+
+impl Router for LeastLoaded {
+    fn route(&mut self, _req: &Request, workers: &[WorkerSignal], _now_s: f64) -> WorkerId {
+        workers[least_loaded(workers)].worker
+    }
+}
+
+/// Deterministic, load-oblivious affinity for session experiments. Session
+/// ordinals are assigned monotonically by the generator, so modulo placement
+/// balances starts exactly while keeping every re-entry on the same worker.
+/// The modulo is over the workers taking work at the time, so a membership
+/// change at run time moves sessions. Synthetic and dataset requests use
+/// round-robin as a benign fallback.
+#[derive(Debug, Default)]
+pub struct SessionAffinity {
+    fallback: RoundRobin,
+}
+
+impl Router for SessionAffinity {
+    fn route(&mut self, req: &Request, workers: &[WorkerSignal], _now_s: f64) -> WorkerId {
+        let n = workers.len().max(1);
+        req.session.as_ref().map_or_else(
+            || self.fallback.pick(workers),
+            |s| workers[s.session as usize % n].worker,
+        )
+    }
+}
+
+/// Send the request to the replica holding the longest cached prefix. With
+/// no cached prefix anywhere it behaves as [`LeastLoaded`]. With
+/// `max_load_ratio = Some(r)`, a holder whose request count exceeds
+/// `r × mean` is passed over for the least-loaded replica (bounded-load
+/// affinity: `r = 1` keeps every replica at or under the mean).
+#[derive(Debug)]
+pub struct PrefixAffinity {
+    pub max_load_ratio: Option<f64>,
+}
+
+impl Router for PrefixAffinity {
+    fn prefix_signal(&self) -> PrefixSignal {
+        PrefixSignal::Cached
+    }
+
+    fn route(&mut self, _req: &Request, workers: &[WorkerSignal], _now_s: f64) -> WorkerId {
+        workers[self.pick(workers)].worker
+    }
+}
+
+impl PrefixAffinity {
+    /// Index into `workers` of the replica to use.
+    fn pick(&self, workers: &[WorkerSignal]) -> usize {
+        let mut best: Option<usize> = None;
+        for (i, w) in workers.iter().enumerate() {
+            let cached = w.cached_prefix_tokens.unwrap_or(0);
+            if cached == 0 {
+                continue;
+            }
+            let better = match best {
+                None => true,
+                Some(b) => {
+                    let bw = &workers[b];
+                    (cached, std::cmp::Reverse(w.in_system()))
+                        > (
+                            bw.cached_prefix_tokens.unwrap_or(0),
+                            std::cmp::Reverse(bw.in_system()),
+                        )
+                }
+            };
+            if better {
+                best = Some(i);
+            }
+        }
+        let Some(holder) = best else {
+            return least_loaded(workers);
+        };
+        if let Some(ratio) = self.max_load_ratio {
+            let n = workers.len() as f64;
+            let mean = workers.iter().map(|w| w.in_system() as f64).sum::<f64>() / n;
+            // A holder is over its bound when it exceeds `ratio × mean` and
+            // is not already the emptiest replica.
+            let cap = ratio * mean;
+            let load = workers[holder].in_system() as f64;
+            if load > cap && holder != least_loaded(workers) {
+                return least_loaded(workers);
+            }
+        }
+        holder
+    }
+}
+
+/// Minimise the estimated prefill work on the request's path: the tokens
+/// it will add (prompt minus the replica's cached prefix) plus
+/// `load_weight` × the prefill tokens already queued there. With
+/// `load_weight = 1` the score is the replica's prefill backlog once this
+/// request is on it, in tokens.
+#[derive(Debug)]
+pub struct KvAware {
+    pub load_weight: f64,
+}
+
+impl Router for KvAware {
+    fn prefix_signal(&self) -> PrefixSignal {
+        PrefixSignal::Cached
+    }
+
+    fn route(&mut self, req: &Request, workers: &[WorkerSignal], _now_s: f64) -> WorkerId {
+        let mut best = 0usize;
+        let mut best_cost = f64::INFINITY;
+        for (i, w) in workers.iter().enumerate() {
+            let cached = w
+                .cached_prefix_tokens
+                .unwrap_or(0)
+                .min(req.num_prompt_tokens);
+            let novel = (req.num_prompt_tokens - cached) as f64;
+            let cost = novel + self.load_weight * w.queued_prefill_tokens as f64;
+            if cost < best_cost {
+                best_cost = cost;
+                best = i;
+            }
+        }
+        workers[best].worker
+    }
+}
+
+/// Decode-side routing for hand-offs. Minimise the KV the transfer must
+/// move (context minus the prompt prefix resident in the decoder's HBM, in
+/// tokens) plus `load_weight` × the decoder's running sequences — the
+/// batch the request joins, whose every step it lengthens. Decoders whose
+/// free KV cannot hold the incoming context are passed over while any can;
+/// if none can, the cheapest is chosen and the request waits there.
+#[derive(Debug)]
+pub struct KvAwareDecode {
+    pub load_weight: f64,
+}
+
+impl Router for KvAwareDecode {
+    fn prefix_signal(&self) -> PrefixSignal {
+        PrefixSignal::Resident
+    }
+
+    fn route(&mut self, req: &Request, workers: &[WorkerSignal], _now_s: f64) -> WorkerId {
+        // The transferred context is the prompt: the first output token's
+        // KV is produced on the decoder.
+        let context = req.num_prompt_tokens;
+        let cost = |w: &WorkerSignal| {
+            let resident = w.cached_prefix_tokens.unwrap_or(0).min(context);
+            (context - resident) as f64 + self.load_weight * w.running as f64
+        };
+        let fits = |w: &WorkerSignal| {
+            let resident = w.cached_prefix_tokens.unwrap_or(0).min(context) as u64;
+            w.free_kv_tokens >= (context as u64).saturating_sub(resident)
+        };
+        let pick = |only_fitting: bool| {
+            let mut best: Option<(usize, f64)> = None;
+            for (i, w) in workers.iter().enumerate() {
+                if only_fitting && !fits(w) {
+                    continue;
+                }
+                let c = cost(w);
+                if best.is_none_or(|(_, bc)| c < bc) {
+                    best = Some((i, c));
+                }
+            }
+            best.map(|(i, _)| i)
+        };
+        workers[pick(true).or_else(|| pick(false)).unwrap_or(0)].worker
+    }
+}
+
+/// What the router did, per pool.
+#[derive(Debug, Clone, Default)]
+pub struct RouterStats {
+    /// Requests routed to each replica, in the order the replicas were
+    /// added to the pool (a fixed topology's replica order; a replica added
+    /// at run time appends an entry when added, and a removed one keeps its
+    /// own).
+    pub per_worker: Vec<u64>,
+    /// Requests routed to a replica the router estimated held a nonzero
+    /// prefix of the prompt. Only counted by routers that ask for the prefix
+    /// signal.
+    pub prefix_routed: u64,
+    /// Requests for which some replica held a nonzero prefix (routed there
+    /// or not). Only counted by routers that ask for the prefix signal.
+    pub prefix_available: u64,
+    /// Requests routed to a replica other than the one holding the longest
+    /// cached prefix while some replica held one.
+    pub prefix_forgone: u64,
+}
+
+impl RouterStats {
+    pub fn new(num_workers: usize) -> Self {
+        Self {
+            per_worker: vec![0; num_workers],
+            ..Default::default()
+        }
+    }
+
+    /// Record one decision. `signals` are the per-replica signals the router
+    /// saw and `chosen` the index of its answer among them; `replica` is that
+    /// replica's entry in `per_worker`.
+    pub fn record(&mut self, signals: &[WorkerSignal], chosen: usize, replica: usize) {
+        if self.per_worker.len() <= replica {
+            self.per_worker.resize(replica + 1, 0);
+        }
+        self.per_worker[replica] += 1;
+        let best = signals
+            .iter()
+            .map(|s| s.cached_prefix_tokens.unwrap_or(0))
+            .max()
+            .unwrap_or(0);
+        if best == 0 {
+            return;
+        }
+        self.prefix_available += 1;
+        if signals[chosen].cached_prefix_tokens.unwrap_or(0) > 0 {
+            self.prefix_routed += 1;
+        }
+        if signals[chosen].cached_prefix_tokens.unwrap_or(0) < best {
+            self.prefix_forgone += 1;
+        }
+    }
+
+    pub fn total(&self) -> u64 {
+        self.per_worker.iter().sum()
+    }
+}
+
+impl std::ops::AddAssign<&RouterStats> for RouterStats {
+    fn add_assign(&mut self, rhs: &RouterStats) {
+        if self.per_worker.len() < rhs.per_worker.len() {
+            self.per_worker.resize(rhs.per_worker.len(), 0);
+        }
+        for (a, b) in self.per_worker.iter_mut().zip(&rhs.per_worker) {
+            *a += b;
+        }
+        self.prefix_routed += rhs.prefix_routed;
+        self.prefix_available += rhs.prefix_available;
+        self.prefix_forgone += rhs.prefix_forgone;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req(prompt: u32) -> Request {
+        Request::new("r".into(), 0, 0.0, prompt, 8)
+    }
+
+    /// Number the replicas with ids unlike their indices, so a router
+    /// answering with an index rather than an id is caught.
+    fn ids(mut ws: Vec<WorkerSignal>) -> Vec<WorkerSignal> {
+        for (i, w) in ws.iter_mut().enumerate() {
+            w.worker = WorkerId(100 + 7 * i as u32);
+        }
+        ws
+    }
+
+    /// Index among `ws` of the replica `id`.
+    fn idx(ws: &[WorkerSignal], id: WorkerId) -> usize {
+        ws.iter()
+            .position(|w| w.worker == id)
+            .expect("a listed worker")
+    }
+
+    fn sig(running: usize, waiting: usize, queued: u64, cached: Option<u32>) -> WorkerSignal {
+        WorkerSignal {
+            worker: WorkerId(0),
+            replica: WorkerId(0),
+            rank: 0,
+            running,
+            waiting,
+            queued_prefill_tokens: queued,
+            kv_util: 0.0,
+            free_kv_tokens: u64::MAX,
+            cached_prefix_tokens: cached,
+        }
+    }
+
+    #[test]
+    fn round_robin_cycles() {
+        let mut r = RoundRobin::default();
+        let ws = ids(vec![sig(0, 0, 0, None); 3]);
+        let picks: Vec<usize> = (0..5)
+            .map(|_| idx(&ws, r.route(&req(10), &ws, 0.0)))
+            .collect();
+        assert_eq!(picks, vec![0, 1, 2, 0, 1]);
+    }
+
+    #[test]
+    fn least_loaded_counts_requests_then_tokens() {
+        let mut r = LeastLoaded;
+        let ws = ids(vec![
+            sig(3, 1, 100, None),
+            sig(2, 1, 900, None),
+            sig(2, 1, 50, None),
+        ]);
+        assert_eq!(idx(&ws, r.route(&req(10), &ws, 0.0)), 2);
+    }
+
+    #[test]
+    fn session_affinity_is_sticky_and_balanced_by_session_ordinal() {
+        let workers = ids(vec![sig(0, 0, 0, None); 3]);
+        let mut router = SessionAffinity::default();
+        for session in 0..6 {
+            let mut request = req(10);
+            request.session = Some(Box::new(crate::request::SessionStep {
+                session,
+                step: 0,
+                gap: 0.0,
+                shared_tokens: 0,
+                shared_prefill_tokens: 0,
+                shared_decode_tokens: 0,
+                kind: None,
+                parent_bytes_written: None,
+                reuse_distance_bytes: None,
+                parent_bytes_touched: None,
+                reuse_touched_bytes: None,
+                next_gap: None,
+                next_shared_tokens: 0,
+            }));
+            assert_eq!(
+                idx(&workers, router.route(&request, &workers, 0.0)),
+                session as usize % 3
+            );
+            request.session.as_mut().unwrap().step = 9;
+            assert_eq!(
+                idx(&workers, router.route(&request, &workers, 0.0)),
+                session as usize % 3
+            );
+        }
+    }
+
+    #[test]
+    fn affinity_prefers_the_holder_and_falls_back_to_load() {
+        let mut r = PrefixAffinity {
+            max_load_ratio: None,
+        };
+        let ws = ids(vec![
+            sig(9, 9, 0, Some(0)),
+            sig(0, 0, 0, Some(64)),
+            sig(0, 0, 0, Some(512)),
+        ]);
+        assert_eq!(idx(&ws, r.route(&req(1024), &ws, 0.0)), 2);
+        // Nothing cached anywhere → least loaded.
+        let ws = ids(vec![
+            sig(2, 0, 0, Some(0)),
+            sig(1, 0, 0, Some(0)),
+            sig(3, 0, 0, Some(0)),
+        ]);
+        assert_eq!(idx(&ws, r.route(&req(1024), &ws, 0.0)), 1);
+    }
+
+    #[test]
+    fn bounded_load_affinity_passes_over_a_hot_holder() {
+        let mut r = PrefixAffinity {
+            max_load_ratio: Some(1.5),
+        };
+        // Holder has 10 in system, mean is 4 → over 1.5 × 4 = 6 → least loaded.
+        let ws = ids(vec![
+            sig(10, 0, 0, Some(512)),
+            sig(1, 0, 0, Some(0)),
+            sig(1, 0, 0, Some(0)),
+        ]);
+        assert_eq!(idx(&ws, r.route(&req(1024), &ws, 0.0)), 1);
+        // Holder at 5 in system, mean 7/3 ≈ 2.33 → cap 3.5 → over → least loaded (index 1).
+        let ws = ids(vec![
+            sig(5, 0, 0, Some(512)),
+            sig(1, 0, 0, Some(0)),
+            sig(1, 0, 0, Some(0)),
+        ]);
+        assert_eq!(idx(&ws, r.route(&req(1024), &ws, 0.0)), 1);
+        // Holder at 3, mean 5/3 → cap 2.5 → over. Holder at 2, cap 2 → within.
+        let ws = ids(vec![
+            sig(2, 0, 0, Some(512)),
+            sig(1, 0, 0, Some(0)),
+            sig(1, 0, 0, Some(0)),
+        ]);
+        assert_eq!(idx(&ws, r.route(&req(1024), &ws, 0.0)), 0);
+        // Everyone loaded equally: holder is within bound.
+        let ws = ids(vec![
+            sig(4, 0, 0, Some(512)),
+            sig(4, 0, 0, Some(0)),
+            sig(4, 0, 0, Some(0)),
+        ]);
+        assert_eq!(idx(&ws, r.route(&req(1024), &ws, 0.0)), 0);
+    }
+
+    #[test]
+    fn kv_aware_trades_prefix_against_backlog() {
+        let mut r = KvAware { load_weight: 1.0 };
+        // Replica 0 holds 900 of 1000 tokens but has 2000 queued: cost 100 + 2000.
+        // Replica 1 holds nothing, 0 queued: cost 1000. → 1.
+        let ws = ids(vec![sig(0, 0, 2000, Some(900)), sig(0, 0, 0, Some(0))]);
+        assert_eq!(idx(&ws, r.route(&req(1000), &ws, 0.0)), 1);
+        // With less backlog the holder wins: 100 + 500 < 1000.
+        let ws = ids(vec![sig(0, 0, 500, Some(900)), sig(0, 0, 0, Some(0))]);
+        assert_eq!(idx(&ws, r.route(&req(1000), &ws, 0.0)), 0);
+        // load_weight = 0 ignores backlog entirely.
+        let mut r = KvAware { load_weight: 0.0 };
+        let ws = ids(vec![sig(0, 0, 1_000_000, Some(900)), sig(0, 0, 0, Some(0))]);
+        assert_eq!(idx(&ws, r.route(&req(1000), &ws, 0.0)), 0);
+    }
+
+    #[test]
+    fn kv_aware_decode_prices_transfer_and_batch_and_checks_fit() {
+        let mut r = KvAwareDecode { load_weight: 64.0 };
+        // Cold context everywhere: pick the smallest running batch.
+        let ws = ids(vec![
+            sig(10, 0, 0, Some(0)),
+            sig(3, 0, 0, Some(0)),
+            sig(7, 0, 0, Some(0)),
+        ]);
+        assert_eq!(idx(&ws, r.route(&req(1024), &ws, 0.0)), 1);
+        // A decoder holding 512 of 1024 saves 512 tokens of transfer, worth
+        // 8 running sequences at load_weight 64: 10 running (512 + 640 =
+        // 1152) beats 3 running cold (1024 + 192 = 1216).
+        let ws = ids(vec![sig(10, 0, 0, Some(512)), sig(3, 0, 0, Some(0))]);
+        assert_eq!(idx(&ws, r.route(&req(1024), &ws, 0.0)), 0);
+        // With 12 running the holder loses: 512 + 768 = 1280 > 1216.
+        let ws = ids(vec![sig(12, 0, 0, Some(512)), sig(3, 0, 0, Some(0))]);
+        assert_eq!(idx(&ws, r.route(&req(1024), &ws, 0.0)), 1);
+        // The emptiest decoder can't fit the context: skipped for one that can.
+        let mut ws = ids(vec![sig(0, 0, 0, Some(0)), sig(5, 0, 0, Some(0))]);
+        ws[0].free_kv_tokens = 100;
+        assert_eq!(idx(&ws, r.route(&req(1024), &ws, 0.0)), 1);
+        // A holder needs room only for what it lacks.
+        let mut ws = ids(vec![sig(0, 0, 0, Some(1000)), sig(5, 0, 0, Some(0))]);
+        ws[0].free_kv_tokens = 100;
+        assert_eq!(idx(&ws, r.route(&req(1024), &ws, 0.0)), 0);
+        // Nobody fits: cheapest anyway.
+        let mut ws = ids(vec![sig(4, 0, 0, Some(0)), sig(2, 0, 0, Some(0))]);
+        ws[0].free_kv_tokens = 0;
+        ws[1].free_kv_tokens = 0;
+        assert_eq!(idx(&ws, r.route(&req(1024), &ws, 0.0)), 1);
+    }
+
+    #[test]
+    fn stats_count_prefix_outcomes() {
+        let mut s = RouterStats::new(2);
+        s.record(&[sig(0, 0, 0, Some(64)), sig(0, 0, 0, Some(0))], 0, 0);
+        s.record(&[sig(0, 0, 0, Some(64)), sig(0, 0, 0, Some(0))], 1, 1);
+        s.record(&[sig(0, 0, 0, Some(0)), sig(0, 0, 0, Some(0))], 1, 1);
+        s.record(&[sig(0, 0, 0, Some(64)), sig(0, 0, 0, Some(16))], 1, 1);
+        assert_eq!(s.per_worker, vec![1, 3]);
+        assert_eq!(s.prefix_available, 3);
+        assert_eq!(s.prefix_routed, 2);
+        assert_eq!(s.prefix_forgone, 2);
+        assert_eq!(s.total(), 4);
+    }
+}

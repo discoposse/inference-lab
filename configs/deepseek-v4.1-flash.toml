@@ -1,0 +1,16 @@
+model = "deepseek-v4.1-flash"
+
+[scheduler]
+max_num_batched_tokens = 8192
+max_num_seqs = 256
+policy = "priority"
+enable_chunked_prefill = true
+block_size = 64
+gpu_memory_utilization = 0.9
+
+[hardware.b300]
+tp = 4
+
+[hardware.h200]
+tp = 8
+scheduler = { max_num_seqs = 150 }

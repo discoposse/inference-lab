@@ -1,0 +1,15 @@
+model = "kimi-k3"
+
+[scheduler]
+max_num_batched_tokens = 16384
+max_num_seqs = 32
+policy = "priority"
+enable_chunked_prefill = true
+block_size = 64
+
+[hardware.b300]
+tp = 8
+
+[hardware.mi355x]
+tp = 8
+scheduler = { max_num_batched_tokens = 8192, max_num_seqs = 30 }

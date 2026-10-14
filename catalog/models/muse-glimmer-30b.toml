@@ -1,0 +1,51 @@
+# meta-models/Muse-Glimmer-30B — dense GQA, hybrid 39 sliding(2048) + 13 full-attention layers, BF16.
+# Architecture: HF meta-models/Muse-Glimmer-30B config.json (text_config,
+# model_type muse_glimmer_text):
+#   52 layers; layer_types: 39 sliding_attention (window 2048) + 13
+#   full_attention (layers 3, 7, ..., 51; NoPE: layer_rope_theta 0);
+#   hidden 6656; 32 q heads, 2 KV heads, head_dim 128; gated attention
+#   output (self_attn.gate_proj 4096x6656); dense SiLU MLP inter 19968;
+#   vocab 202048 (untied); max_position_embeddings 131072. The vision tower
+#   (1.92B params) is not modelled. All weights BF16; KV bf16: with no
+#   --kv-cache-dtype set, SGLang's "auto" is the model dtype
+#   (srt/mem_cache/kv_cache_dtype.py). SGLang serves it as a hybrid-SWA model
+#   (srt/configs/model_config.py, is_hybrid_swa_model), so sliding layers
+#   keep only their window.
+#
+# Param split, exact from the safetensors headers (all non-expert; norms
+# omitted):
+#   attention per layer: q 4096x6656 + k 256x6656 + v 256x6656 + o 6656x4096
+#     + gate 4096x6656 = 85_196_800; x 52 = 4_430_233_600
+#   MLP per layer 3*6656*19968 = 398_721_024; x 52 = 20_733_493_248
+#   lm_head 202048x6656 = 1_344_831_488
+#   active = 26_508_558_336; + embedding 1_344_831_488 -> resident
+#   27_853_389_824
+#
+# Modelled directly: 39 sliding(2048) and 13 full GQA attention classes (window KV and window attention FLOPs exact).
+
+name = "Muse-Glimmer-30B"
+hidden_dim = 6656
+max_seq_len = 131072
+attention_precision = "bf16"
+
+[[weights]]
+precision = "bf16"
+active_params = 26508558336
+resident_params = 27853389824
+
+[[layers]]
+kind = "attention"
+count = 39
+heads = 32
+head_dim = 128
+kv_heads = 2
+window = 2048
+kv_precision = "bf16"
+
+[[layers]]
+kind = "attention"
+count = 13
+heads = 32
+head_dim = 128
+kv_heads = 2
+kv_precision = "bf16"

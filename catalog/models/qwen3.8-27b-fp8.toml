@@ -1,0 +1,62 @@
+# Qwen/Qwen3.8-27B-FP8 — DENSE hybrid (GatedDeltaNet linear + gated GQA full attention, no MoE), FP8.
+# Architecture: HF Qwen/Qwen3.8-27B-FP8 config.json (text_config, model_type
+# qwen3_5_text) matches Qwen/Qwen3.5-27B-FP8's in every architecture field
+# (it adds output_gate_type "swish" and a top-level partial_rotary_factor
+# 0.25, both already implied by the 3.5 config):
+#   64 layers, full_attention_interval 4 -> 16 full-attn + 48 linear;
+#   hidden 5120; full attn: 24 q / 4 kv heads, head_dim 256, output gate
+#   fused into q_proj; linear: 16 key / 48 value heads x 128, conv 4; dense
+#   MLP inter 17408 every layer; vocab 248320 (untied); max_pos 262144.
+#   1 MTP layer and the vision tower not modelled. Checkpoint FP8 (128x128
+#   blocks) except linear in_proj_a/in_proj_b, lm_head and embedding (BF16).
+# Launch (SGLang): --kv-cache-dtype fp8_e4m3, --mamba-ssm-dtype
+# bfloat16.
+#
+# Param split, exact from the safetensors headers (layers 0-63; norms,
+# conv1d, A_log, dt_bias and scale_inv omitted):
+#   fp8: full-attn q 12288x5120 + k 1024x5120 + v 1024x5120 + o 5120x6144
+#     = 104_857_600 x 16 = 1_677_721_600; linear in_proj_qkv 10240x5120 +
+#     in_proj_z 6144x5120 + out_proj 5120x6144 = 115_343_360 x 48 =
+#     5_536_481_280; MLP 3*5120*17408 = 267_386_880 x 64 = 17_112_760_320
+#     -> 24_326_963_200
+#   bf16: linear in_proj_a + in_proj_b 2 x 48x5120 x 48 = 23_592_960;
+#     lm_head 248320x5120 = 1_271_398_400 -> active 1_294_991_360;
+#     + embedding 1_271_398_400 -> resident 2_566_389_760
+# Against qwen3.5-27b-fp8.toml (same architecture): that entry leaves out
+# the full-attention o_proj (503M params) and carries lm_head at fp8 with
+# bf16 KV; this split follows the 3.8 checkpoint's tensors and an fp8
+# KV dtype.
+#
+# Linear state, as SGLang allocates it (srt/configs/mamba_utils.py,
+# Mamba2StateShape.create and mamba2_state_dtype): temporal 48 heads x 128 x
+# 128 at the launch's bfloat16 = 1_572_864 B; conv (kernel - 1 = 3) x
+# conv_dim (6144 + 2*16*128 = 10240) at bf16 = 61_440 B -> 1_634_304 B per
+# layer per sequence. (qwen3.5-*.toml use 4 conv taps: 1_654_784.)
+
+name = "Qwen3.8-27B-FP8"
+hidden_dim = 5120
+max_seq_len = 262144
+attention_precision = "bf16"
+
+[[weights]]
+precision = "fp8"
+active_params = 24326963200
+resident_params = 24326963200
+
+[[weights]]
+precision = "bf16"
+active_params = 1294991360
+resident_params = 2566389760
+
+[[layers]]
+kind = "attention"
+count = 16
+heads = 24
+head_dim = 256
+kv_heads = 4
+kv_precision = "fp8"
+
+[[layers]]
+kind = "linear"
+count = 48
+state_bytes = 1634304

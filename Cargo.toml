@@ -1,0 +1,83 @@
+[package]
+name = "inference-lab"
+version = "1.0.0"
+edition = "2021"
+authors = ["Doubleword"]
+description = "High-performance LLM inference simulator for analyzing serving systems"
+license = "MIT"
+repository = "https://github.com/doublewordai/inference-lab"
+readme = "README.md"
+keywords = ["llm", "inference", "simulator", "performance"]
+categories = ["simulation", "wasm"]
+exclude = ["pkg/", ".npmrc", "node_modules/", "calibration/"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "inference-lab"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[dependencies]
+toml = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4.5", features = ["derive"], optional = true }
+rand = "0.10"
+rand_distr = "0.6"
+ordered-float = "4.0"
+env_logger = { version = "0.11", optional = true }
+log = "0.4"
+tabled = { version = "0.21", optional = true }
+colored = { version = "2.1", optional = true }
+tokenizers = { version = "0.23", optional = true }
+minijinja = { version = "2.0", optional = true }
+tokio = { version = "1", features = ["full"], optional = true }
+axum = { version = "0.8", optional = true }
+tower-http = { version = "0.7", features = ["cors"], optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
+tokio-stream = { version = "0.1", optional = true }
+# Serve runs its own hyper accept loop (instead of axum::serve) so fault injection can
+# reach the raw TCP socket — see serve::fault (`reset` mode needs SO_LINGER=0).
+hyper = { version = "1", features = ["http1", "http2", "server"], optional = true }
+hyper-util = { version = "0.1", features = ["http1", "http2", "server-auto", "tokio"], optional = true }
+tower = { version = "0.5", features = ["util"], optional = true }
+socket2 = { version = "0.6", optional = true }
+wasm-bindgen = "0.2"
+serde-wasm-bindgen = "0.6"
+js-sys = "0.3"
+getrandom = { version = "0.4", features = ["wasm_js"] }
+console_error_panic_hook = "0.1"
+rustc-hash = "2"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tikv-jemallocator = { version = "0.6", optional = true }
+
+[dev-dependencies]
+tempfile = "3.8"
+rayon = "1"
+
+[features]
+default = ["cli", "jemalloc"]
+cli = ["clap", "env_logger", "tabled", "colored", "tokenizers", "minijinja"]
+jemalloc = ["dep:tikv-jemallocator"]
+serve = [
+    "cli",
+    "tokio",
+    "axum",
+    "tower-http",
+    "uuid",
+    "tokio-stream",
+    "hyper",
+    "hyper-util",
+    "tower",
+    "socket2",
+]
+
+[profile.release]
+opt-level = "s" # Optimize for size in WASM
+debug = true # Enable debug symbols for profiling
+lto = "fat"
+codegen-units = 1
+panic = "unwind"

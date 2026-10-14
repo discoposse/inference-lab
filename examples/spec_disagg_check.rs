@@ -1,0 +1,248 @@
+//! Disaggregated control for the ISL>>OSL over-speculation tail.
+//!
+//! Colocated (single pool), the decode-only GoodputBudget policy over-speculates
+//! by up to ~6% at large batch when ISL >> OSL, because deep verify competes with
+//! the prefill sharing the GPU. Prediction: disaggregate prefill onto its own
+//! pool and that competition disappears -- the decode pool runs pure decode, so
+//! the decode-only policy should match the best fixed gamma exactly.
+//!
+//! Setup: prefill pool with `P_WORKERS` workers (provisioned so prefill is not
+//! the bottleneck -> the decode batch fills toward `conc`), one decode worker
+//! running spec. Same V4-Flash / B200, same ISL=3840/OSL=512, alpha=0.75,
+//! c_draft=0.10 as the colocated C1 sweep.
+//!
+//! Run: `cargo run --release --example spec_disagg_check --no-default-features`
+
+mod common;
+
+use inference_lab::config::DisaggTopology;
+use inference_lab::config::{
+    AcceptanceModel, ClusterSpec, DrafterCost, FabricConfig, FabricLink, GammaPolicy,
+    HardwareConfig, ParallelConfig, SchedulerConfig, SpeculativeConfig,
+};
+use inference_lab::scheduler::SchedulingPolicy;
+use inference_lab::simulation::{simulate_closed_loop, ClosedLoop, Topology};
+use rayon::prelude::*;
+use std::collections::BTreeMap;
+
+fn b200() -> HardwareConfig {
+    HardwareConfig {
+        name: "B200".into(),
+        flops_fp4: Some(9.0e15),
+        flops_fp8: Some(4.5e15),
+        flops_bf16: Some(2.25e15),
+        flops_fp16: Some(2.25e15),
+        memory_bandwidth: 8.0e12,
+        memory_capacity: 206_158_430_208,
+        memory: None,
+        fabric: Some(FabricConfig {
+            gpus_per_node: 8,
+            scale_up: FabricLink {
+                bandwidth: 9.0e11,
+                latency: 5e-6,
+                in_network_reduction: true,
+            },
+            scale_out: None,
+        }),
+    }
+}
+
+fn scheduler() -> SchedulerConfig {
+    SchedulerConfig {
+        max_num_batched_tokens: 8192,
+        max_num_seqs: 32768,
+        max_waiting: 0,
+        enable_chunked_prefill: true,
+        mix_prefill_with_decode: true,
+        overlap_schedule: false,
+        prefill_delayer_max_passes: 0,
+        idle_pass_s: 0.0,
+        long_prefill_decode_interval: 0,
+        long_prefill_min_tokens: 262_144,
+        long_prefill_token_threshold: 0,
+        max_num_partial_prefills: 1,
+        block_size: 64,
+        gpu_memory_utilization: 0.9,
+        kv_cache_capacity: 0,
+        max_model_len: None,
+        policy: SchedulingPolicy::FCFS,
+        enable_preemption_free: true,
+        enable_cascade_attention: false,
+        balance_set: None,
+    }
+}
+
+fn cluster(num_workers: u32) -> ClusterSpec {
+    ClusterSpec {
+        hardware: b200(),
+        parallel: ParallelConfig {
+            tp: 1,
+            ep: 1,
+            dp_attention: false,
+        },
+        num_workers,
+        memory: Default::default(),
+        step_cost: Default::default(),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Policy {
+    NoSpec,
+    Fixed(u32),
+    Budget(u32),
+}
+
+fn spec_for(p: Policy, alpha: f64, c_draft: f64) -> Option<SpeculativeConfig> {
+    let acceptance = AcceptanceModel::Constant { alpha };
+    match p {
+        Policy::NoSpec => None,
+        Policy::Fixed(g) => Some(SpeculativeConfig {
+            gamma: g,
+            acceptance,
+            policy: GammaPolicy::Fixed,
+            measured_cost: None,
+            switch: Default::default(),
+            drafter: Some(DrafterCost::Fraction { frac: c_draft }),
+        }),
+        Policy::Budget(g) => Some(SpeculativeConfig {
+            gamma: g,
+            acceptance,
+            policy: GammaPolicy::GoodputBudget,
+            measured_cost: None,
+            switch: Default::default(),
+            drafter: Some(DrafterCost::Fraction { frac: c_draft }),
+        }),
+    }
+}
+
+/// Returns (goodput_tok_s, decode_batch).
+fn run(
+    conc: u32,
+    isl: u32,
+    osl: u32,
+    p_workers: u32,
+    p: Policy,
+    alpha: f64,
+    c_draft: f64,
+) -> (f64, f64) {
+    let topo = DisaggTopology {
+        prefill: ClusterSpec {
+            num_workers: p_workers,
+            ..cluster(p_workers)
+        },
+        decode: cluster(1),
+        kv_link_bw: Some(9.0e11),
+    };
+    let topology =
+        Topology::from_disagg(&topo, common::deepseek_v4_flash(), scheduler()).expect("topo");
+    let total = (conc * 16).max(2000);
+    let warmup = conc * 4;
+    let res = simulate_closed_loop(
+        topology,
+        &ClosedLoop {
+            concurrency: conc,
+            isl,
+            osl,
+            num_completions: total,
+            warmup_completions: warmup,
+            spec: spec_for(p, alpha, c_draft),
+            seed: 7,
+            skip_prefill: false,
+        },
+    )
+    .expect("run");
+    let goodput = res.throughput() * osl as f64;
+    let dbatch = res
+        .mean_batch_per_pool
+        .get(1)
+        .copied()
+        .flatten()
+        .unwrap_or(0.0);
+    (goodput, dbatch)
+}
+
+fn main() {
+    let isl = 3840u32;
+    let osl = 512u32;
+    let alpha = 0.75;
+    let c_draft = 0.10;
+    let gamma_max = 8u32;
+    let fixed = [1u32, 2, 3, 4, 5, 6, 7, 8];
+    // One dedicated prefill worker per user -> prefill never queues, decode batch
+    // fills toward conc (verified by the `dbatch` column) until the single decode
+    // worker saturates. Low concs probe the no-spec/shallow shoulder; high concs
+    // probe decode-pool saturation.
+    let concs = [1u32, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
+
+    // Column layout per conc: 0 = nospec, 1..=8 = fixed g1..g8, 9 = BUDGET.
+    // Build a flat task list over (conc, col, policy) and run every sim in parallel;
+    // the decode pool is a single worker so per-sim live state stays small.
+    let mut tasks: Vec<(u32, usize, Policy)> = Vec::new();
+    for &conc in &concs {
+        tasks.push((conc, 0, Policy::NoSpec));
+        for (i, &g) in fixed.iter().enumerate() {
+            tasks.push((conc, 1 + i, Policy::Fixed(g)));
+        }
+        tasks.push((conc, 9, Policy::Budget(gamma_max)));
+    }
+    let results: Vec<(u32, usize, f64, f64)> = tasks
+        .par_iter()
+        .map(|&(conc, col, p)| {
+            let p_workers = conc; // dedicated prefill per user
+            let (gp, db) = run(conc, isl, osl, p_workers, p, alpha, c_draft);
+            (conc, col, gp, db)
+        })
+        .collect();
+
+    let mut gp: BTreeMap<u32, [f64; 10]> = BTreeMap::new();
+    let mut dbatch: BTreeMap<u32, f64> = BTreeMap::new();
+    for (conc, col, g, db) in results {
+        gp.entry(conc).or_insert([0.0; 10])[col] = g;
+        if col == 0 {
+            dbatch.insert(conc, db);
+        }
+    }
+
+    println!("Disagg control: V4-Flash, B200, decode pool TP1, prefill pool = conc workers");
+    println!("ISL={isl} OSL={osl} alpha={alpha} c_draft={c_draft}. goodput = committed tok/s.\n");
+    print!("{:>5} {:>8}", "conc", "dbatch");
+    print!(" {:>9}", "nospec");
+    for g in fixed {
+        print!(" {:>9}", format!("fix g{g}"));
+    }
+    print!(
+        " {:>9} {:>9} {:>7} {:>7}",
+        "best-fix", "BUDGET", "argmax", "d%"
+    );
+    println!();
+
+    for &conc in &concs {
+        let row = gp[&conc];
+        let ns = row[0];
+        let bud = row[9];
+        let mut best = ns;
+        let mut bestg = 0u32;
+        for (i, &g) in fixed.iter().enumerate() {
+            if row[1 + i] > best {
+                best = row[1 + i];
+                bestg = g;
+            }
+        }
+        let d = 100.0 * (bud - best) / best;
+        print!("{conc:>5} {:>8.1}", dbatch[&conc]);
+        print!(" {ns:>9.0}");
+        for i in 0..8 {
+            print!(" {:>9.0}", row[1 + i]);
+        }
+        let argmax = if bestg == 0 {
+            "nospec".into()
+        } else {
+            format!("g{bestg}")
+        };
+        print!(" {best:>9.0} {bud:>9.0} {argmax:>7} {d:>+7.2}");
+        println!();
+    }
+    println!("\nPrediction: with prefill disaggregated, the decode pool runs pure decode,");
+    println!("so BUDGET should match best-fix (d% ~ 0) even at ISL >> OSL.");
+}

@@ -10,6 +10,7 @@
   "scripts": {
     "build": "wasm-pack build --target web --no-default-features --out-dir pkg",
     "build:cli": "cargo build --release",
+    "test:wasm": "node tests/wasm/browser_package.mjs",
     "publish:npm": "npm publish --access public"
   },
   "repository": {

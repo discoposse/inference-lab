@@ -335,6 +335,7 @@ impl Config {
         let workload = WorkloadConfig {
             dataset_path: None,
             sessions_path: None,
+            sessions: None,
             num_sessions: None,
             stationary_start_sessions: None,
             resample_sessions: false,

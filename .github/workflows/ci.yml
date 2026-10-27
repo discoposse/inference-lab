@@ -17,6 +17,8 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - name: Locate libstdc++
+        run: echo "LIBRARY_PATH=$(dirname "$(gcc -print-file-name=libstdc++.so)")" >> "$GITHUB_ENV"
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
@@ -31,9 +33,29 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
+          components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Build (wasm surface)
-        run: cargo build --no-default-features --target wasm32-unknown-unknown
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Locate libstdc++
+        run: echo "LIBRARY_PATH=$(dirname "$(gcc -print-file-name=libstdc++.so)")" >> "$GITHUB_ENV"
+      - name: Clippy (wasm)
+        run: cargo clippy --no-default-features --target wasm32-unknown-unknown -- -D warnings
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: Build release CLI
+        run: cargo build --release
+      - name: Build browser package
+        run: wasm-pack build --target web --no-default-features --out-dir pkg
+      - name: Test browser package
+        run: node tests/wasm/browser_package.mjs
+      - name: Upload browser package
+        uses: actions/upload-artifact@v4
+        with:
+          name: inference-lab-wasm-${{ github.sha }}
+          path: pkg/
+          if-no-files-found: error
 
   docker:
     runs-on: ubuntu-latest

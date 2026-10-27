@@ -151,10 +151,13 @@ struct SimulationResult {
     time_series: TimeSeriesData,
     distributions: DistributionData,
     latency_samples: LatencySamplesData,
+    /// Full summary (prefix cache, work, memory graph, per-worker HBM,
+    /// router). Per-tier and per-link reports read `summary.memory`.
+    summary: MetricsSummary,
 }
 
-/// Progress event for `run_simulation_streaming`. Samples and lengths are
-/// deltas since the previous event.
+/// Progress event for `run_simulation_streaming`. Samples, lengths, and
+/// time-series points are deltas since the previous event.
 #[derive(Serialize)]
 struct ProgressUpdate {
     current_time: f64,
@@ -170,7 +173,7 @@ struct ProgressUpdate {
 }
 
 impl ProgressUpdate {
-    fn from_progress(p: &ProgressInfo<'_>) -> Self {
+    fn from_progress(p: &ProgressInfo<'_>, series: &[TimeSeriesPoint]) -> Self {
         Self {
             current_time: p.current_time,
             completed_requests: p.completed_requests,
@@ -178,7 +181,7 @@ impl ProgressUpdate {
             running: p.running,
             waiting: p.waiting,
             kv_cache_util: p.kv_cache_util,
-            time_series: TimeSeriesData::from_points(p.time_series),
+            time_series: TimeSeriesData::from_points(series),
             metrics: MetricsData::from_summary(&p.metrics, p.current_time),
             latency_samples: LatencySamplesData::from_samples(&p.latency_samples),
             distribution_samples: DistributionData {
@@ -194,22 +197,26 @@ fn build_simulator(config_json: &str) -> Result<Simulator, JsValue> {
     let mut config: Config = serde_json::from_str(config_json)
         .map_err(|e| JsValue::from_str(&format!("Config parse error: {e}")))?;
     config.finalize();
+    // One sample per simulated second. A tenth-second series is too large
+    // for a long browser run and stalls the page when it is streamed.
     Simulator::new(config, None)
-        .map(|s| s.with_time_series(0.1))
+        .map(|s| s.with_time_series(1.0))
         .map_err(|e| JsValue::from_str(&format!("Simulator error: {e}")))
 }
 
 fn final_result(simulator: &mut Simulator) -> Result<JsValue, JsValue> {
     let total_time = simulator.current_time();
     let summary = simulator.summary();
+    let metrics = MetricsData::from_summary(&summary, total_time);
     let result = SimulationResult {
-        metrics: MetricsData::from_summary(&summary, total_time),
+        metrics,
         time_series: TimeSeriesData::from_points(simulator.time_series()),
         distributions: DistributionData {
             input_lengths: simulator.input_lengths().to_vec(),
             output_lengths: simulator.output_lengths().to_vec(),
         },
         latency_samples: LatencySamplesData::from_samples(&simulator.latency_samples()),
+        summary,
     };
     Ok(serde_wasm_bindgen::to_value(&result)?)
 }
@@ -232,14 +239,28 @@ pub fn run_simulation_streaming(
     progress_callback: &Function,
 ) -> Result<JsValue, JsValue> {
     let mut simulator = build_simulator(config_json)?;
+    let mut sent = 0usize;
     simulator
         .run_with_callback(|progress| {
-            if let Ok(js_value) =
-                serde_wasm_bindgen::to_value(&ProgressUpdate::from_progress(&progress))
-            {
+            // Send only the time-series points added since the previous
+            // event, so a long run does not re-serialize the whole series.
+            let n = progress.time_series.len();
+            let start = sent.min(n);
+            let update = ProgressUpdate::from_progress(&progress, &progress.time_series[start..]);
+            sent = n;
+            if let Ok(js_value) = serde_wasm_bindgen::to_value(&update) {
                 let _ = progress_callback.call1(&JsValue::null(), &js_value);
             }
         })
         .map_err(|e| JsValue::from_str(&format!("Simulation error: {e}")))?;
     final_result(&mut simulator)
+}
+
+/// Shipped accelerator and model presets as a JSON string.
+///
+/// `gpus` and `hardware` are the same list (the accelerator presets).
+/// `models` is the model presets. Each entry is `{ "id", "preset" }`.
+#[wasm_bindgen]
+pub fn catalog_json() -> String {
+    crate::catalog::export_json()
 }

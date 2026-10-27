@@ -158,6 +158,7 @@ fn run_one(cfg: &RunConfig, sessions: &[SessionSpec]) -> RunResult {
     let workload = WorkloadConfig {
         dataset_path: None,
         sessions_path: None,
+        sessions: None,
         num_sessions: Some(cfg.num_sessions),
         stationary_start_sessions: Some((cfg.num_sessions / 2) as u32),
         resample_sessions: true,

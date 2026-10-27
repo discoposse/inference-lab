@@ -224,7 +224,10 @@ pub struct MemoryGraph {
     pending_buffer_cleanup: Vec<(StoreId, Span)>,
     /// Source ranges held resident until their promotion flow drains.
     pending_pins: HashMap<String, PendingPin>,
-    /// Workers whose free HBM changed when a peer-source pin released.
+    /// Workers to schedule again. A peer-source pin release frees HBM on
+    /// the source worker; a store pin release frees stage room on every
+    /// worker that tiers that store. Either can be the only thing a
+    /// waiting request is blocked on, and neither is that request's flow.
     wake_workers: HashSet<WorkerId>,
     /// Workers removed from the topology at run time.
     retired: HashSet<WorkerId>,
@@ -1245,6 +1248,11 @@ impl MemoryGraph {
                 }
             }
             self.radix.lock().unwrap().trim_store_after_unpin(store);
+            // The landed copy was the capacity gate for every other stage
+            // into this store. Those requests sit in `waiting` with no flow
+            // of their own, so the worker that consumed the copy is not
+            // enough: every worker that can stage into the store has to run.
+            self.wake_store_waiters(store);
         }
     }
 
@@ -1642,6 +1650,7 @@ impl MemoryGraph {
                 .lock()
                 .unwrap()
                 .trim_store_after_unpin(fill.destination);
+            self.wake_store_waiters(fill.destination);
         }
         self.release_pending_pin(id);
     }
@@ -1673,6 +1682,24 @@ impl MemoryGraph {
             TierSource::Store(store) => {
                 debug_assert!(evicted.is_empty());
                 self.deferred_store_trims.insert(store);
+                // A stage into this store can be blocked on an in-flight
+                // reader's pin (`capacity - pinned`). Releasing it does not
+                // complete any flow of the workers left in `waiting`.
+                self.wake_store_waiters(store);
+            }
+        }
+    }
+
+    /// Schedule every live worker that uses `store` as a tier. Stage
+    /// admission is per store, not per worker: a pin held by one worker
+    /// refuses the others, and dropping it is their only wakeup.
+    fn wake_store_waiters(&mut self, store: StoreId) {
+        for (worker, tiers) in self.tiers.iter().enumerate() {
+            if self.retired.contains(&worker) {
+                continue;
+            }
+            if tiers.iter().any(|tier| tier.store == store) {
+                self.wake_workers.insert(worker);
             }
         }
     }

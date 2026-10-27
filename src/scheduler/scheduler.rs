@@ -642,6 +642,10 @@ impl Scheduler {
         // preemption means KV is full, so admitting would just be preempted
         // again).
         if admit && decision.num_preempted == 0 {
+            // Requests whose stage cannot start until a pin drops. Held out
+            // of the queue for this pass so a later request can still run
+            // and release that pin; put back in front afterwards.
+            let mut staging_blocked = Vec::new();
             while !self.waiting.is_empty() && token_budget > 0 {
                 if self.running.len() >= self.config.max_num_seqs as usize {
                     break;
@@ -755,14 +759,15 @@ impl Scheduler {
                         StagePark::Blocked(request) => {
                             // The destination store is full of pinned blocks
                             // (or the copy is arriving from another request's
-                            // stage). A stage completion / consumption frees
-                            // the room and re-runs a schedule pass, which
-                            // retries this request. Do NOT `continue` here:
-                            // nothing about the store can change within this
-                            // pass, so re-selecting the same head spins
-                            // forever.
-                            self.waiting.insert(selected_idx, request);
-                            break;
+                            // stage). Leave this request out of the queue for
+                            // the rest of the pass: the pin holder may be
+                            // behind it, and stopping here means that holder
+                            // never starts the load that frees the store.
+                            // Re-selecting this same request would spin, so
+                            // it stays deferred until the pass ends. A later
+                            // completion or pin release wakes the worker.
+                            staging_blocked.push(request);
+                            continue;
                         }
                         StagePark::Fallback(mut request) => {
                             // The external prefix can never be staged. Mark
@@ -931,6 +936,9 @@ impl Scheduler {
                 });
                 token_budget -= tokens_to_schedule;
                 self.running.push(request);
+            }
+            for request in staging_blocked.into_iter().rev() {
+                self.waiting.push_front(request);
             }
         }
 

@@ -583,6 +583,118 @@ bandwidth = 1e12
         assert!(memory.stores[0].bytes_read > 0);
     }
 
+    /// Two workers share a one-block host tier in front of a cluster store.
+    /// A re-entry stages into that block and pins it; the other worker's
+    /// re-entry is refused until the pin drops. The refusal used to leave
+    /// the second worker asleep after the pin was released, so the run
+    /// stalled with the request still needing a stage and no event queued.
+    #[test]
+    fn shared_store_stage_resumes_after_the_host_tier_pin_drops() {
+        const MEM: &str = r#"
+gpus_per_node = 2
+[[stores]]
+name = "host_dram"
+per = "node"
+capacity = 1e15
+[[stores]]
+name = "cluster_nvme"
+per = "cluster"
+capacity = 1e15
+bandwidth = 1e12
+stripe = 1
+latency = 1e-3
+[[junctions]]
+name = "pcie"
+per = "gpu"
+[[links]]
+name = "pcie"
+from = "gpu"
+to = "pcie"
+bandwidth = 1e12
+[[links]]
+name = "pcie-host"
+from = "pcie"
+to = "host_dram"
+bandwidth = 1e12
+[[links]]
+name = "nic"
+from = "gpu"
+to = "network"
+bandwidth = 1e12
+[[links]]
+name = "core"
+from = "network"
+to = "cluster_nvme"
+bandwidth = 1e12
+"#;
+        let (mut cluster, model, mut sched) = small_dense_parts();
+        cluster.hardware.memory = Some(toml::from_str(MEM).unwrap());
+        let block_bytes = model.kv_storage_bytes(sched.block_size) as f64;
+        cluster.memory = toml::from_str(&format!(
+            r#"
+tiers = ["host_dram", "cluster_nvme"]
+write = {{ policy = "write_through" }}
+[capacity]
+host_dram = {block_bytes}
+"#
+        ))
+        .unwrap();
+        cluster.num_workers = 2;
+        // Three blocks. A finished prompt leaves one cached block, so the
+        // two-block churn request has to recycle it.
+        sched.kv_cache_capacity = 3 * block_bytes as u64;
+        sched.max_num_seqs = 1;
+        let mut engine = Engine::new(
+            Topology::aggregated(cluster, model, sched)
+                .unwrap()
+                .with_router(&RouterConfig::RoundRobin {}),
+        );
+        let req = |id: &str, t: f64, hashes: Vec<u64>| {
+            let mut r = Request::new(id.into(), 0, t, hashes.len() as u32 * 16, 2);
+            r.prompt_block_hashes = hashes;
+            r
+        };
+        engine.submit(req("a", 0.0, vec![1]));
+        engine.submit(req("b", 0.01, vec![2]));
+        engine.submit(req("churn-a", 1.0, vec![10, 11]));
+        engine.submit(req("churn-b", 1.01, vec![12, 13]));
+        // b's re-entry arrives while a's cluster→host stage still pins the
+        // only host block.
+        engine.submit(req("a-re", 2.0, vec![1, 3]));
+        engine.submit(req("b-re", 2.0001, vec![2, 4]));
+        let mut done = Vec::new();
+        let err = loop {
+            if engine.next_event_time().is_none() {
+                break Some(format!(
+                    "stalled at t={}: running {} waiting {}{}",
+                    engine.current_time(),
+                    engine.aggregate_running(),
+                    engine.aggregate_waiting(),
+                    engine.describe_stuck_workers()
+                ));
+            }
+            match engine.step() {
+                Ok(outcome) => done.extend(outcome.completions),
+                Err(e) => break Some(e),
+            }
+            if done.len() >= 6 {
+                break None;
+            }
+        };
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(done.len(), 6);
+        let memory = engine.memory_metrics().expect("tiers");
+        let cluster = memory
+            .stores
+            .iter()
+            .find(|store| store.name == "cluster_nvme")
+            .expect("cluster store");
+        assert!(
+            cluster.bytes_read > 0,
+            "the re-entry must read the shared store, not recompute it"
+        );
+    }
+
     #[test]
     fn disagg_decode_pool_does_not_reprefill_handed_off_requests() {
         let (cluster, model, sched) = small_dense_parts();

@@ -768,6 +768,11 @@ impl KVCacheManager {
     /// queued for recycling tail first, so the end of a sequence is evicted
     /// before its beginning and what survives is always a prefix.
     pub fn free_request(&mut self, request: &mut Request) {
+        // A stage pins its destination until the HBM load consumes it. A
+        // request that finishes, is preempted, or gives the blocks back
+        // without that load would otherwise leave the pin forever, and the
+        // store can fill with copies nobody is allowed to evict.
+        self.cancel_staging(&request.request_id);
         let (in_path, anon) = self.content_hold_of(request);
         let aux = request.aux_blocks.len() as u32;
         request.kv_blocks.clear();
@@ -1958,6 +1963,52 @@ mod tests {
         };
         assert!(sum > slowest);
         assert!((manager.estimate_remaining_time("parallel") - slowest).abs() < 1e-9);
+    }
+
+    /// A stage pins its destination until the HBM load consumes it. A
+    /// request that finishes without that load (the hand-off path admits
+    /// it from HBM, or it is preempted) has to drop the pin, or the host
+    /// tier fills with copies a later stage is not allowed to evict.
+    #[test]
+    fn freeing_a_request_releases_a_stage_pin_it_never_loaded() {
+        let graph = MemoryGraph::private_with(
+            1,
+            &[("t0", 1, 1e9), ("t1", 8, 1e9)],
+            1,
+            Arc::new(|t| 100 * t as u64),
+        )
+        .shared_handle();
+        let mut manager = KVCacheManager::new(10_000, 1, |t| 100 * t as u64, 0, true)
+            .with_memory(graph.clone(), 0);
+        manager.plant_in_tier_path(1, &[1]);
+        manager.plant_in_tier_path(1, &[2]);
+
+        // Two tokens: the last one is always computed, so exactly one block
+        // is eligible to stage. That fills the one-block host tier.
+        let mut a = create_test_request("a", 2);
+        a.prompt_block_hashes = vec![1, 9];
+        let lookup = manager.peek_prefix_cache(&a);
+        assert_eq!(
+            manager.start_staging("a".into(), &lookup, 0.0),
+            StageStart::Started,
+            "lookup {lookup:?}"
+        );
+        {
+            let mut graph = graph.lock().unwrap();
+            graph.advance(10.0);
+            graph.accept_staged_batch("a");
+        }
+        // No HBM load, so nothing else releases the destination pin.
+        manager.free_request(&mut a);
+
+        let mut b = create_test_request("b", 2);
+        b.prompt_block_hashes = vec![2, 8];
+        let lookup = manager.peek_prefix_cache(&b);
+        assert_eq!(
+            manager.start_staging("b".into(), &lookup, 1.0),
+            StageStart::Started,
+            "a finished request's stage pin must not fill the host tier"
+        );
     }
 }
 

@@ -60,6 +60,12 @@ pub struct WorkloadConfig {
     #[serde(default)]
     pub sessions_path: Option<String>,
 
+    /// Inline sessions (same schema as a session file line), for callers
+    /// with no filesystem such as the WASM build. Takes precedence over
+    /// `sessions_path` when both are set.
+    #[serde(default)]
+    pub sessions: Option<Vec<crate::request::session::SessionSpec>>,
+
     /// Session mode: maximum number of session starts. This does not limit
     /// the total request steps emitted by those sessions; `num_requests`
     /// provides that separate bound. Sessions cycle through the file, so this

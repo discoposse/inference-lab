@@ -124,7 +124,19 @@ impl Simulator {
         if config.workload.dataset_path.is_some() && config.workload.sessions_path.is_some() {
             return Err("workload sets both dataset_path and sessions_path".into());
         }
-        let request_generator = if let Some(sessions_path) = &config.workload.sessions_path {
+        if config.workload.dataset_path.is_some() && config.workload.sessions.is_some() {
+            return Err("workload sets both dataset_path and sessions".into());
+        }
+        let request_generator = if let Some(sessions) = &config.workload.sessions {
+            if sessions.is_empty() {
+                return Err("workload.sessions is empty".into());
+            }
+            RequestGenerator::from_sessions(
+                config.workload.clone(),
+                config.scheduler.block_size,
+                sessions.clone(),
+            )
+        } else if let Some(sessions_path) = &config.workload.sessions_path {
             let sessions = SessionSpec::load(sessions_path)?;
             RequestGenerator::from_sessions(
                 config.workload.clone(),

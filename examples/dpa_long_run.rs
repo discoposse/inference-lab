@@ -190,6 +190,7 @@ fn config(lambda_rank: f64, duration_secs: f64, prefill_hbm_factor: f64) -> Conf
         workload: WorkloadConfig {
             dataset_path: None,
             sessions_path: Some("data/sessions/tracelab.jsonl".into()),
+            sessions: None,
             num_sessions: None,
             stationary_start_sessions: None,
             resample_sessions: true,

@@ -87,7 +87,8 @@ fn every_shipped_config_runs_on_each_of_its_hardware_entries() {
 
 /// Every catalog model and hardware preset is exercised by the test above:
 /// some shipped config deploys each model, and some config entry runs on
-/// each hardware preset.
+/// each hardware preset. A preset with no published dense FLOP rate is
+/// exempt: a roofline deployment cannot name it.
 #[test]
 fn every_catalog_entry_appears_in_a_shipped_config() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("configs");
@@ -105,6 +106,25 @@ fn every_catalog_entry_appears_in_a_shipped_config() {
         let cfg = ModelConfig::from_file(&p).unwrap_or_else(|e| panic!("{e}"));
         hardware.extend(cfg.hardware_names().into_iter().map(String::from));
     }
+    // A preset with no published dense FLOP rate cannot back a roofline
+    // deployment, so no file under configs/ names it. Memory figures are
+    // still part of the catalog. The moment a rate is filled in, this list
+    // must be empty and a config has to reference the preset.
+    let no_flop_rate: Vec<&str> = inference_lab::catalog::hardware_names()
+        .into_iter()
+        .filter(|n| {
+            let hw = inference_lab::catalog::hardware(n).unwrap();
+            hw.flops_fp4.is_none()
+                && hw.flops_fp8.is_none()
+                && hw.flops_bf16.is_none()
+                && hw.flops_fp16.is_none()
+        })
+        .collect();
+    assert_eq!(
+        no_flop_rate,
+        vec!["m5-pro"],
+        "only the preset with no published dense rates may lack a config"
+    );
     let unused: Vec<String> = inference_lab::catalog::model_names()
         .into_iter()
         .filter(|n| !models.contains(*n))
@@ -112,7 +132,7 @@ fn every_catalog_entry_appears_in_a_shipped_config() {
         .chain(
             inference_lab::catalog::hardware_names()
                 .into_iter()
-                .filter(|n| !hardware.contains(*n))
+                .filter(|n| !hardware.contains(*n) && !no_flop_rate.contains(n))
                 .map(|n| format!("hardware {n}")),
         )
         .collect();

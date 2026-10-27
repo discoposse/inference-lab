@@ -126,7 +126,7 @@ println!("Throughput: {:.1} tok/s", summary.throughput_metrics.output_tokens_per
 ### WebAssembly
 
 ```javascript
-import init, { run_simulation } from '@doublewordai/inference-lab';
+import init, { catalog_json, run_simulation } from '@doublewordai/inference-lab';
 
 await init();
 
@@ -161,6 +161,19 @@ const config = {
 const results = run_simulation(JSON.stringify(config));
 console.log('TTFT P50:', results.metrics.ttft_p50);
 console.log('Throughput:', results.metrics.output_tokens_per_sec);
+
+// `results.summary` is the full metrics summary: prefix cache, work,
+// per-worker accelerator memory, router counts, and — when the deployment
+// names KV tiers — `summary.memory.stores` and `summary.memory.links`.
+// `run_simulation_streaming` reports the same result and sends progress
+// events whose time series, samples and lengths are only the new points.
+//
+// `catalog_json()` is the shipped presets as JSON. `gpus` and `hardware`
+// are the accelerator presets; `models` is the model presets. A trace with
+// no filesystem is `workload.sessions`, an inline session list. It takes
+// precedence over `sessions_path`.
+const catalog = JSON.parse(catalog_json());
+console.log(catalog.hardware.map((entry) => entry.id));
 ```
 
 ## Configuration

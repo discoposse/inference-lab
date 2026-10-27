@@ -1,0 +1,26 @@
+# Apple M5 Pro, stock 24 GB configuration.
+#
+# Cited from Apple's public pages (retrieved 2026-10-27):
+# - https://www.apple.com/macbook-pro/specs/
+#   Both M5 Pro SKUs (15-core CPU with a 16-core GPU, and 18-core CPU with a
+#   20-core GPU) list 307 GB/s unified memory bandwidth. Memory before
+#   configure-to-order is 24 GB unified memory.
+# - https://support.apple.com/en-us/126318
+#   Same 307 GB/s bandwidth and 24 GB base. Configure-to-order lists 48 GB,
+#   and 64 GB on the 20-core GPU.
+# - https://www.apple.com/newsroom/2026/03/apple-debuts-m5-pro-and-m5-max-to-supercharge-the-most-demanding-pro-workflows/
+#   "up to 64GB of unified memory" and "unified memory bandwidth up to 307GB/s".
+#
+# Bandwidth is the published 307 GB/s as decimal bytes/s (307e9), the same
+# byte convention as the other presets. Capacity is the stock 24 GB part,
+# not the 48 GB or 64 GB configure-to-order options. Unified memory is the
+# accelerator memory below, not a second store.
+#
+# TODO: Apple does not publish dense FLOP rates, a scale-up fabric, or a
+# bandwidth for local storage or for any shared KV store. Those stay unset.
+# A roofline model rejects this preset until a measured step cost supplies
+# the missing rates. Do not fill them with guessed numbers.
+
+name = "M5 Pro"
+memory_bandwidth = 307e9
+memory_capacity = 24000000000

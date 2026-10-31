@@ -71,7 +71,9 @@ and the network core), inclusive of HBM. Cluster stores may stripe one access
 over several bandwidth units while a separate aggregate edge is the single
 contention point for all accesses; store access latency is paid before bytes
 flow. Writes, promotions, cascades between tiers and hand-offs are all
-transfers on the graph's edges.
+transfers on the graph's edges. A store's optional `read_bandwidth` caps
+fetches that promote KV back toward the GPU. Writes and backups keep using
+`bandwidth`. Omit `read_bandwidth` and fetches keep sharing that pipe.
 
 `peer_hbm` is a virtual node-local tier rather than another store. A lookup
 can source the next prefix span from a sibling worker's resident HBM and

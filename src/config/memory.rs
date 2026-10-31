@@ -35,6 +35,12 @@
 //! throughput edge (`aggregate_bandwidth`, or `nodes × bandwidth`) and a
 //! private `stripe × bandwidth` cap on each transfer.
 //!
+//! Optional `read_bandwidth` caps fetches that promote KV blocks from the
+//! store back toward the GPU. It uses the same per instance scaling, and
+//! on a cluster store the same stripe and node count, as `bandwidth`.
+//! Writes and backups keep using `bandwidth`. Omit `read_bandwidth` and
+//! every transfer still shares the one pipe.
+//!
 //! Deployment side — which stores hold evicted KV, closest first, how much
 //! of each they may use, and the write and eviction policies:
 //!
@@ -542,6 +548,12 @@ pub struct StoreTemplate {
     /// Unset: unbounded — only the links limit.
     #[serde(default)]
     pub bandwidth: Option<f64>,
+    /// Fetch rate per instance, bytes per second. When set, reads that
+    /// promote KV blocks from this store back toward the GPU are capped by
+    /// this rate instead of `bandwidth`. Writes and backups keep using
+    /// `bandwidth`. Unset means fetches share the `bandwidth` pipe.
+    #[serde(default)]
+    pub read_bandwidth: Option<f64>,
     /// Number of this cluster store's bandwidth units one transfer may use
     /// in parallel. The transfer is still bounded by the shared aggregate
     /// throughput. Defaults to one.
@@ -680,6 +692,12 @@ impl MemoryTemplate {
                     if s.bandwidth.is_some_and(|b| b <= 0.0) {
                         return Err(format!("[memory] store `{}` needs bandwidth > 0", s.name));
                     }
+                    if s.read_bandwidth.is_some_and(|b| b <= 0.0) {
+                        return Err(format!(
+                            "[memory] store `{}` needs read_bandwidth > 0",
+                            s.name
+                        ));
+                    }
                 }
                 StoreKind::PeerHbm => {
                     if s.name != "peer_hbm" {
@@ -691,7 +709,7 @@ impl MemoryTemplate {
                     if s.per != Scope::Node {
                         return Err("[memory] `peer_hbm` must be per = \"node\"".to_string());
                     }
-                    if s.capacity != 0.0 || s.bandwidth.is_some() {
+                    if s.capacity != 0.0 || s.bandwidth.is_some() || s.read_bandwidth.is_some() {
                         return Err(
                             "[memory] `peer_hbm` has no capacity or bandwidth of its own"
                                 .to_string(),
@@ -997,6 +1015,7 @@ bandwidth = 1e12
         assert_eq!(pool.stripe, 4);
         assert_eq!(pool.aggregate_bandwidth, Some(200e9));
         assert_eq!(pool.latency, 2e-3);
+        assert_eq!(pool.read_bandwidth, None);
 
         let defaults: MemoryTemplate =
             toml::from_str("[[stores]]\nname = \"pool\"\nper = \"cluster\"\ncapacity = 1.0")
@@ -1005,6 +1024,14 @@ bandwidth = 1e12
         assert_eq!(pool.stripe, 1);
         assert_eq!(pool.aggregate_bandwidth, None);
         assert_eq!(pool.latency, 0.0);
+        assert_eq!(pool.read_bandwidth, None);
+
+        let with_read: MemoryTemplate = toml::from_str(
+            "[[stores]]\nname = \"pool\"\nper = \"cluster\"\ncapacity = 1.0\nbandwidth = 10\nread_bandwidth = 40\n",
+        )
+        .unwrap();
+        assert_eq!(with_read.store("pool").unwrap().read_bandwidth, Some(40.0));
+        assert_eq!(with_read.store("pool").unwrap().bandwidth, Some(10.0));
     }
 
     #[test]
@@ -1045,7 +1072,12 @@ bandwidth = 1e12
         )
         .is_err());
 
-        for bad in ["stripe = 0", "aggregate_bandwidth = 0", "latency = -1"] {
+        for bad in [
+            "stripe = 0",
+            "aggregate_bandwidth = 0",
+            "latency = -1",
+            "read_bandwidth = 0",
+        ] {
             let raw = format!("[[stores]]\nname = \"x\"\nper = \"cluster\"\ncapacity = 1.0\n{bad}");
             let t: MemoryTemplate = toml::from_str(&raw).unwrap();
             assert!(t.validate().is_err(), "{bad}");

@@ -16,7 +16,10 @@
 //! shared by every worker on that node — what one worker demotes, its
 //! neighbours can promote. A `per = "cluster"` store is one instance behind
 //! the scale-out network and visible to every worker. Its striped bandwidth
-//! caps one transfer while an aggregate edge is shared topology-wide. A
+//! caps one transfer while an aggregate edge is shared topology-wide.
+//! Optional `read_bandwidth` gives fetches that promote KV back toward the
+//! GPU their own stripe cap and aggregate. Writes and backups stay on
+//! `bandwidth`. Without `read_bandwidth`, fetches still share that pipe. A
 //! promotion either stages bytes one store at a time before the final GPU
 //! load, or moves them directly from the source store to the worker's GPU; a
 //! prefill → decode hand-off follows the shortest path from one GPU to the
@@ -63,8 +66,15 @@ pub struct Store {
     /// topology-wide aggregate rate for a cluster store.
     pub throughput_edge: Option<EdgeId>,
     /// Per-transfer cap from striping, bytes/s. This is a private edge in
-    /// the flow solver rather than a shared graph edge.
+    /// the flow solver rather than a shared graph edge. Writes and backups
+    /// use it. Fetches use it when `read_transfer_bandwidth` is unset.
     pub transfer_bandwidth: Option<f64>,
+    /// Fetch throughput edge. Present only when the template sets
+    /// `read_bandwidth`. Fetches cross this instead of `throughput_edge`.
+    pub read_throughput_edge: Option<EdgeId>,
+    /// Per-transfer fetch cap from striping, bytes/s. Present only when
+    /// the template sets `read_bandwidth`.
+    pub read_transfer_bandwidth: Option<f64>,
     /// Fixed cost paid by every fetch or write touching the store.
     pub latency: f64,
     pub eviction: EvictionPolicy,
@@ -80,6 +90,29 @@ pub struct Store {
     pub bytes_read: u64,
     /// Bytes evicted or expired without ever being promoted.
     pub dead_bytes: u64,
+}
+
+impl Store {
+    /// Throughput edge a fetch crosses. The shared store edge when no
+    /// separate read rate is configured.
+    fn fetch_throughput_edge(&self) -> Option<EdgeId> {
+        self.read_throughput_edge.or(self.throughput_edge)
+    }
+
+    /// Private cap on one fetch. The write stripe cap when no separate
+    /// read rate is configured.
+    fn fetch_transfer_bandwidth(&self) -> Option<f64> {
+        self.read_transfer_bandwidth.or(self.transfer_bandwidth)
+    }
+}
+
+/// Tighter of two optional per-transfer caps.
+fn tighter_cap(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) | (None, Some(a)) => Some(a),
+        (None, None) => None,
+    }
 }
 
 /// A route through the graph: edges in order and the latency paid before
@@ -331,6 +364,8 @@ impl MemoryGraph {
         capacity_blocks: u64,
         throughput: Option<f64>,
         transfer_bandwidth: Option<f64>,
+        read_throughput: Option<f64>,
+        read_transfer_bandwidth: Option<f64>,
         latency: f64,
         eviction: EvictionPolicy,
     ) -> StoreId {
@@ -339,6 +374,10 @@ impl MemoryGraph {
             return pos;
         }
         let throughput_edge = throughput.map(|b| self.flows.add_edge(format!("{name}:store"), b));
+        // Only a configured read rate adds an edge, so an absent
+        // `read_bandwidth` leaves the edge list identical to before.
+        let read_throughput_edge =
+            read_throughput.map(|b| self.flows.add_edge(format!("{name}:store:read"), b));
         let rid = self
             .radix
             .lock()
@@ -353,6 +392,8 @@ impl MemoryGraph {
             vertex,
             throughput_edge,
             transfer_bandwidth,
+            read_throughput_edge,
+            read_transfer_bandwidth,
             latency,
             eviction,
             next: None,
@@ -505,22 +546,29 @@ impl MemoryGraph {
         self.refresh_peer_tiers(node, w);
         if let (true, Some(t)) = (fresh, cluster.hardware.memory.as_ref()) {
             for st in &t.stores {
-                let (Scope::Cluster, None, Some(bandwidth)) =
-                    (st.per, st.aggregate_bandwidth, st.bandwidth)
-                else {
+                if st.per != Scope::Cluster {
                     continue;
-                };
+                }
                 let vertex = self
                     .vertex_index
                     .get(&VertexKey::Named(st.name.clone(), 0))
                     .copied();
-                let edge = self
+                let (write_edge, read_edge) = self
                     .stores
                     .iter()
                     .find(|s| Some(s.vertex) == vertex)
-                    .and_then(|s| s.throughput_edge);
-                if let Some(edge) = edge {
-                    self.flows.widen(edge, bandwidth);
+                    .map(|s| (s.throughput_edge, s.read_throughput_edge))
+                    .unwrap_or((None, None));
+                // Default aggregate grows by one node's `bandwidth`. An
+                // explicit `aggregate_bandwidth` stays fixed. A separate
+                // read pipe grows by one node's `read_bandwidth`.
+                if st.aggregate_bandwidth.is_none() {
+                    if let (Some(bandwidth), Some(edge)) = (st.bandwidth, write_edge) {
+                        self.flows.widen(edge, bandwidth);
+                    }
+                }
+                if let (Some(read_bandwidth), Some(edge)) = (st.read_bandwidth, read_edge) {
+                    self.flows.widen(edge, read_bandwidth);
                 }
             }
         }
@@ -632,6 +680,16 @@ impl MemoryGraph {
                     st.bandwidth.map(|b| b * st.stripe as f64),
                 ),
             };
+            // `None` here is the whole compatibility path. No read edge and
+            // no read cap are created, so fetches keep using `bandwidth`.
+            let (read_throughput, read_transfer_bandwidth) = match st.read_bandwidth {
+                Some(rate) => match st.per {
+                    Scope::Gpu => (Some(rate * gpu_mult), None),
+                    Scope::Node => (Some(rate * node_mult), None),
+                    Scope::Cluster => (Some(rate * total_nodes), Some(rate * st.stripe as f64)),
+                },
+                None => (None, None),
+            };
             self.add_store(
                 &st.name,
                 st.per,
@@ -639,6 +697,8 @@ impl MemoryGraph {
                 (per_instance as f64 * mult) as u64,
                 throughput,
                 transfer_bandwidth,
+                read_throughput,
+                read_transfer_bandwidth,
                 st.latency,
                 eviction,
             );
@@ -686,8 +746,10 @@ impl MemoryGraph {
             let mut write = self.shortest_path(gv, sv).ok_or_else(|| {
                 format!("[memory] worker {w}'s gpu cannot reach tier `{name}` to write")
             })?;
-            if let Some(e) = self.stores[store].throughput_edge {
+            if let Some(e) = self.stores[store].fetch_throughput_edge() {
                 fetch.edges.insert(0, e);
+            }
+            if let Some(e) = self.stores[store].throughput_edge {
                 write.edges.push(e);
             }
             fetch.latency += self.stores[store].latency;
@@ -748,6 +810,8 @@ impl MemoryGraph {
                     per,
                     owner,
                     capacity_blocks,
+                    None,
+                    None,
                     None,
                     None,
                     0.0,
@@ -1389,7 +1453,7 @@ impl MemoryGraph {
             &t.fetch_path.edges,
             bytes as f64,
             t.fetch_path.latency,
-            self.stores[t.store].transfer_bandwidth,
+            self.stores[t.store].fetch_transfer_bandwidth(),
         )
     }
 
@@ -1414,7 +1478,7 @@ impl MemoryGraph {
                 self.stores[source_store].vertex,
                 self.stores[destination_store].vertex,
             ) {
-                if let Some(edge) = self.stores[source_store].throughput_edge {
+                if let Some(edge) = self.stores[source_store].fetch_throughput_edge() {
                     path.edges.insert(0, edge);
                 }
                 if let Some(edge) = self.stores[destination_store].throughput_edge {
@@ -1422,14 +1486,10 @@ impl MemoryGraph {
                 }
                 path.latency +=
                     self.stores[source_store].latency + self.stores[destination_store].latency;
-                let cap = match (
-                    self.stores[source_store].transfer_bandwidth,
+                let cap = tighter_cap(
+                    self.stores[source_store].fetch_transfer_bandwidth(),
                     self.stores[destination_store].transfer_bandwidth,
-                ) {
-                    (Some(a), Some(b)) => Some(a.min(b)),
-                    (Some(a), None) | (None, Some(a)) => Some(a),
-                    (None, None) => None,
-                };
+                );
                 let stage =
                     self.flows
                         .estimate_new_capped(&path.edges, bytes as f64, path.latency, cap);
@@ -1446,7 +1506,7 @@ impl MemoryGraph {
         let (path, transfer_bandwidth) = match source {
             TierSource::Store(store) => (
                 self.tiers[worker][tier].fetch_path.clone(),
-                self.stores[store].transfer_bandwidth,
+                self.stores[store].fetch_transfer_bandwidth(),
             ),
             TierSource::PeerHbm(source) => match self.peer_path(source, worker) {
                 Some(p) => (p, None),
@@ -1500,21 +1560,17 @@ impl MemoryGraph {
         let mut path = self
             .shortest_path(self.stores[source].vertex, self.stores[destination].vertex)
             .ok_or(StageDenied::Impossible)?;
-        if let Some(edge) = self.stores[source].throughput_edge {
+        if let Some(edge) = self.stores[source].fetch_throughput_edge() {
             path.edges.insert(0, edge);
         }
         if let Some(edge) = self.stores[destination].throughput_edge {
             path.edges.push(edge);
         }
         path.latency += self.stores[source].latency + self.stores[destination].latency;
-        let transfer_bandwidth = match (
-            self.stores[source].transfer_bandwidth,
+        let transfer_bandwidth = tighter_cap(
+            self.stores[source].fetch_transfer_bandwidth(),
             self.stores[destination].transfer_bandwidth,
-        ) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (Some(a), None) | (None, Some(a)) => Some(a),
-            (None, None) => None,
-        };
+        );
         let id = format!("{request}#stage:{tier}:{source}:{destination}");
         let mut total = 0u64;
         let mut entries = Vec::new();
@@ -1756,7 +1812,7 @@ impl MemoryGraph {
         let (path, transfer_bandwidth) = match source {
             TierSource::Store(store) => (
                 self.tiers[worker][tier].fetch_path.clone(),
-                self.stores[store].transfer_bandwidth,
+                self.stores[store].fetch_transfer_bandwidth(),
             ),
             TierSource::PeerHbm(source_worker) => (
                 self.peer_path(source_worker, worker)
@@ -3157,5 +3213,232 @@ bandwidth = 900
         // And neither: an error.
         let mut g4 = build10(&[&bare, &bare], None).unwrap();
         assert!(g4.handoff_path(0, 1).is_err());
+    }
+
+    fn shared_cluster(read_bandwidth: Option<f64>, workers: u32, stripe: u32) -> MemoryGraph {
+        let read = match read_bandwidth {
+            Some(rate) => format!("read_bandwidth = {rate}\n"),
+            None => String::new(),
+        };
+        let mem = format!(
+            "\
+gpus_per_node = 1
+[[stores]]
+name = \"shared\"
+per = \"cluster\"
+capacity = 100000
+bandwidth = 10
+stripe = {stripe}
+{read}\
+[[links]]
+name = \"nic\"
+from = \"gpu\"
+to = \"network\"
+bandwidth = 100000
+[[links]]
+name = \"core\"
+from = \"network\"
+to = \"shared\"
+bandwidth = 100000
+"
+        );
+        let mut c = cluster(&["shared"], workers, 1, 1);
+        c.hardware.memory = Some(toml::from_str(&mem).unwrap());
+        build10(&[&c], None).unwrap()
+    }
+
+    fn drain(g: &mut MemoryGraph) -> f64 {
+        while let Some(dt) = g.next_completion_delay() {
+            let now = g.flows().now();
+            g.advance(now + dt);
+        }
+        g.flows().now()
+    }
+
+    /// One block write from worker 0. Returns the projected transfer time.
+    fn write_one_block(g: &mut MemoryGraph) -> f64 {
+        let span = sp(g, 1);
+        g.write(0, span, None);
+        g.estimate_remaining("w:0:0:0")
+    }
+
+    #[test]
+    fn read_bandwidth_absent_keeps_the_shared_pipe() {
+        let mem = r#"
+gpus_per_node = 1
+[[stores]]
+name = "shared"
+per = "node"
+capacity = 100000
+bandwidth = 10
+[[links]]
+name = "link"
+from = "gpu"
+to = "shared"
+bandwidth = 100000
+"#;
+        let template: MemoryTemplate = toml::from_str(mem).unwrap();
+        assert_eq!(template.store("shared").unwrap().read_bandwidth, None);
+
+        let mut c = cluster(&["shared"], 1, 1, 1);
+        c.hardware.memory = Some(template);
+        c.memory = toml::from_str("tiers = [\"shared\"]").unwrap();
+        let mut g = build10(&[&c], None).unwrap();
+
+        let store = &g.stores()[0];
+        assert!(store.read_throughput_edge.is_none());
+        assert!(store.read_transfer_bandwidth.is_none());
+        assert!(g
+            .flows()
+            .edges()
+            .iter()
+            .all(|e| e.name != "shared:store:read"));
+        let fetch = g.tiers(0)[0].fetch_path.edges[0];
+        let write = *g.tiers(0)[0].write_path.edges.last().unwrap();
+        assert_eq!(fetch, write, "fetches and writes cross one store edge");
+        assert_eq!(g.flows().edges()[fetch].capacity, 10.0);
+
+        let promote = g.estimate_promotion(0, 0, 10);
+        let write_time = write_one_block(&mut g);
+        assert_eq!(promote.to_bits(), 1.0f64.to_bits());
+        assert_eq!(write_time.to_bits(), promote.to_bits());
+
+        // Cluster stripe cap stays `stripe × bandwidth` when the field is omitted.
+        let mut cluster = shared_cluster(None, 4, 2);
+        assert!(cluster.stores()[0].read_throughput_edge.is_none());
+        assert_eq!(cluster.stores()[0].transfer_bandwidth, Some(20.0));
+        let fetch = cluster.tiers(3)[0].fetch_path.edges[0];
+        let write = *cluster.tiers(3)[0].write_path.edges.last().unwrap();
+        assert_eq!(fetch, write);
+        assert_eq!(
+            cluster.estimate_promotion(3, 0, 100).to_bits(),
+            5.0f64.to_bits()
+        );
+        assert_eq!(write_one_block(&mut cluster).to_bits(), 0.5f64.to_bits());
+    }
+
+    #[test]
+    fn read_bandwidth_caps_fetches_and_leaves_writes_on_bandwidth() {
+        let template: MemoryTemplate = toml::from_str(
+            "\
+gpus_per_node = 1
+[[stores]]
+name = \"shared\"
+per = \"node\"
+capacity = 100000
+bandwidth = 10
+read_bandwidth = 40
+[[links]]
+name = \"link\"
+from = \"gpu\"
+to = \"shared\"
+bandwidth = 100000
+",
+        )
+        .unwrap();
+        assert_eq!(template.store("shared").unwrap().read_bandwidth, Some(40.0));
+        assert_eq!(template.store("shared").unwrap().bandwidth, Some(10.0));
+
+        let mut c = cluster(&["shared"], 1, 1, 1);
+        c.hardware.memory = Some(template);
+        c.memory = toml::from_str("tiers = [\"shared\"]").unwrap();
+        let mut g = build10(&[&c], None).unwrap();
+        let fetch = g.tiers(0)[0].fetch_path.edges[0];
+        let write = *g.tiers(0)[0].write_path.edges.last().unwrap();
+        assert_ne!(fetch, write);
+        assert_eq!(g.flows().edges()[fetch].name, "shared:store:read");
+        assert_eq!(g.flows().edges()[fetch].capacity, 40.0);
+        assert_eq!(g.flows().edges()[write].name, "shared:store");
+        assert_eq!(g.flows().edges()[write].capacity, 10.0);
+        assert_eq!(g.estimate_promotion(0, 0, 10).to_bits(), 0.25f64.to_bits());
+        // Same write as the absent case, still limited by `bandwidth`.
+        assert_eq!(write_one_block(&mut g).to_bits(), 1.0f64.to_bits());
+
+        // A backup moves at `bandwidth`, not at the faster read rate.
+        let backup: MemoryTemplate = toml::from_str(
+            "\
+gpus_per_node = 1
+[[stores]]
+name = \"shared\"
+per = \"node\"
+capacity = 10
+bandwidth = 10
+read_bandwidth = 1000
+[[stores]]
+name = \"cold\"
+per = \"node\"
+capacity = 100000
+bandwidth = 1000
+[[links]]
+name = \"link\"
+from = \"gpu\"
+to = \"shared\"
+bandwidth = 100000
+[[links]]
+name = \"cold-link\"
+from = \"gpu\"
+to = \"cold\"
+bandwidth = 100000
+",
+        )
+        .unwrap();
+        let mut c = cluster(&["shared", "cold"], 1, 1, 1);
+        c.hardware.memory = Some(backup);
+        c.memory = toml::from_str("tiers = [\"shared\", \"cold\"]").unwrap();
+        let mut g = build10(&[&c], None).unwrap();
+        g.plant(0, 0, sp(&g, 1));
+        g.plant(0, 0, sp(&g, 2));
+        assert_eq!(g.estimate_remaining("c:0:1:0").to_bits(), 1.0f64.to_bits());
+        drain(&mut g);
+        let read_edge = g.stores()[0].read_throughput_edge.unwrap();
+        let write_edge = g.stores()[0].throughput_edge.unwrap();
+        assert_eq!(g.flows().edges()[read_edge].bytes_moved, 0.0);
+        assert!(close(g.flows().edges()[write_edge].bytes_moved, 10.0));
+
+        // Cluster fetch cap is `stripe × read_bandwidth`. The write cap is unchanged.
+        let mut fast = shared_cluster(Some(50.0), 4, 2);
+        let mut same_write = shared_cluster(None, 4, 2);
+        assert_eq!(fast.stores()[0].read_transfer_bandwidth, Some(100.0));
+        assert_eq!(fast.stores()[0].transfer_bandwidth, Some(20.0));
+        assert_eq!(
+            fast.flows().edges()[fast.stores()[0].read_throughput_edge.unwrap()].capacity,
+            200.0
+        );
+        assert_eq!(
+            fast.estimate_promotion(0, 0, 100).to_bits(),
+            1.0f64.to_bits()
+        );
+        assert_eq!(
+            write_one_block(&mut fast).to_bits(),
+            write_one_block(&mut same_write).to_bits()
+        );
+    }
+
+    /// Four workers write once, then each pulls a large prefix back. Raising
+    /// `read_bandwidth` shortens the fetch phase and leaves the write phase
+    /// on `bandwidth`.
+    #[test]
+    fn read_heavy_workload_gets_faster_with_higher_read_bandwidth() {
+        fn run(read_bandwidth: f64) -> (u64, u64) {
+            let mut g = shared_cluster(Some(read_bandwidth), 4, 1);
+            for w in 0..4 {
+                g.write(w as usize, sp(&g, 10 + w), None);
+            }
+            let write_done = drain(&mut g);
+            let started = g.flows().now();
+            for w in 0..4 {
+                g.submit_promotion(w as usize, 0, &format!("r{w}"), 1000, &[], started);
+            }
+            let read_done = drain(&mut g);
+            (write_done.to_bits(), (read_done - started).to_bits())
+        }
+
+        let (write_lo, read_lo) = run(10.0);
+        let (write_hi, read_hi) = run(40.0);
+        assert_eq!(write_lo, write_hi, "write cost stays on bandwidth");
+        assert_eq!(write_lo, 1.0f64.to_bits());
+        assert_eq!(read_lo, 100.0f64.to_bits());
+        assert_eq!(read_hi, 25.0f64.to_bits());
+        assert!(f64::from_bits(read_hi) < f64::from_bits(read_lo));
     }
 }

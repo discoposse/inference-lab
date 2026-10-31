@@ -134,7 +134,7 @@ own.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `gpus_per_node` | U32 | fabric's, else 1 | GPUs sharing a node's `per = "node"` stores |
-| `stores` | Array | `[]` | `{ name, per = "gpu" \| "node" \| "cluster", kind = "store", capacity, bandwidth, stripe = 1, aggregate_bandwidth, latency = 0, pin = false }` — bytes per instance; a `gpu` store is private to its GPU, a `node` store is one pool for the node's GPUs, and a `cluster` store is one topology-wide pool behind the network. `bandwidth` is the store throughput per instance (per node for a cluster store). A cluster transfer can use `stripe × bandwidth`, while all its transfers share `aggregate_bandwidth` or, by default, `nodes × bandwidth`. `latency` is the fixed access cost in seconds on every fetch or write. The reserved `{ name = "peer_hbm", per = "node", kind = "peer_hbm" }` entry is virtual: no `capacity`/`bandwidth`, read-only, and `pin` defaults to true |
+| `stores` | Array | `[]` | `{ name, per = "gpu" \| "node" \| "cluster", kind = "store", capacity, bandwidth, read_bandwidth, stripe = 1, aggregate_bandwidth, latency = 0, pin = false }`. Bytes per instance. A `gpu` store is private to its GPU, a `node` store is one pool for the node's GPUs, and a `cluster` store is one topology-wide pool behind the network. `bandwidth` is the store throughput per instance (per node for a cluster store). A cluster transfer can use `stripe × bandwidth`, while all its transfers share `aggregate_bandwidth` or, by default, `nodes × bandwidth`. `latency` is the fixed access cost in seconds on every fetch or write. Optional `read_bandwidth` is unset by default. The reserved `{ name = "peer_hbm", per = "node", kind = "peer_hbm" }` entry is virtual, with no `capacity`, `bandwidth`, or `read_bandwidth`. It is read-only, and `pin` defaults to true |
 | `junctions` | Array | `[]` | `{ name, per }` — a point with no capacity of its own, so that several links can share one (a GPU's PCIe port feeding host DRAM and NVMe) |
 | `links` | Array | `[]` | `{ name, from, to, bandwidth, latency = 0 }` — `from` is `"gpu"` (one port per GPU), `"network"`, a store or a junction; `to` is a store, a junction, `"switch"` (the node's scale-up fabric) or `"network"` (the scale-out core). One instance per instance of `from`, full duplex at `bandwidth` bytes/s each way |
 
@@ -149,6 +149,16 @@ first, the residual is shared among the rest. Tier promotions run store →
 GPU; `peer_hbm` promotions run
 from the selected sibling GPU through the node switch to the destination
 GPU; hand-offs run GPU → network → GPU (see `kv_link_bw`).
+
+A store may set `read_bandwidth` in bytes per second. Fetches that promote KV
+blocks from that store back toward the GPU are capped by it. Writes into the
+store and backups to the next tier keep using `bandwidth`. Leave
+`read_bandwidth` unset and fetches share the `bandwidth` pipe, so existing
+configs keep the same transfer times. The read rate scales like `bandwidth`.
+A per GPU or per node store pools it across the worker's instances, and a
+cluster store lets one fetch use `stripe` times `read_bandwidth` while
+concurrent fetches share `nodes` times `read_bandwidth`. An explicit
+`aggregate_bandwidth` still sizes only the write pipe.
 
 Shipped presets, at datasheet figures: `b200` (192 GB / 8 TB/s), `b300`
 (288 GB / 8 TB/s), `gh200` (96 GB / 4 TB/s), `h100` (80 GB / 3.35 TB/s),
